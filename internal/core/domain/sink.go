@@ -19,3 +19,23 @@ type SinkResult struct {
 	Error    error
 	Duration time.Duration
 }
+
+type BatchingSink interface {
+	Sink
+	ProcessBatch(ctx context.Context, events []CDCEvent) error
+	FlushTimeout() time.Duration
+	MaxBatchSize() int
+}
+
+func SupportsBatching(s Sink) bool {
+	_, ok := s.(BatchingSink)
+	return ok
+}
+
+type DeadLetterEntry struct {
+	Event     CDCEvent
+	SinkName  string
+	Error     error
+	Attempts  int
+	Timestamp time.Time
+}

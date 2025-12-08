@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emoss08/gtc/internal/core/ports"
@@ -14,10 +14,12 @@ import (
 )
 
 type Config struct {
-	DatabaseURL     string
-	SlotName        string
-	PublicationName string
-	StandbyTimeout  time.Duration
+	DatabaseURL        string
+	SlotName           string
+	PublicationName    string
+	StandbyTimeout     time.Duration
+	ReconnectBackoff   time.Duration
+	MaxReconnectBackoff time.Duration
 }
 
 type Reader struct {
@@ -25,8 +27,7 @@ type Reader struct {
 	logger    *slog.Logger
 	conn      *pgconn.PgConn
 	decoder   *Decoder
-	clientLSN pglogrepl.LSN
-	mu        sync.RWMutex
+	clientLSN atomic.Uint64
 	shutdown  chan struct{}
 }
 
@@ -46,18 +47,75 @@ func (r *Reader) Start(ctx context.Context, handler ports.WALEventHandler) error
 		slog.Duration("standby_timeout", r.config.StandbyTimeout),
 	)
 
-	if err := r.connect(ctx); err != nil {
-		r.logger.Error("connection failed", slog.String("error", err.Error()))
-		return err
+	backoff := r.config.ReconnectBackoff
+	if backoff == 0 {
+		backoff = time.Second
+	}
+	maxBackoff := r.config.MaxReconnectBackoff
+	if maxBackoff == 0 {
+		maxBackoff = 30 * time.Second
 	}
 
-	if err := r.setupReplication(ctx); err != nil {
-		r.logger.Error("replication setup failed", slog.String("error", err.Error()))
-		return err
-	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.shutdown:
+			return nil
+		default:
+		}
 
-	r.logger.Info("WAL streaming started, listening for changes")
-	return r.streamLoop(ctx, handler)
+		if err := r.connect(ctx); err != nil {
+			r.logger.Error("connection failed", slog.String("error", err.Error()))
+			r.waitWithBackoff(ctx, backoff)
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		}
+
+		if err := r.setupReplication(ctx); err != nil {
+			r.logger.Error("replication setup failed", slog.String("error", err.Error()))
+			r.closeConnection(ctx)
+			r.waitWithBackoff(ctx, backoff)
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		}
+
+		backoff = r.config.ReconnectBackoff
+		if backoff == 0 {
+			backoff = time.Second
+		}
+
+		r.logger.Info("WAL streaming started, listening for changes")
+		if err := r.streamLoop(ctx, handler); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			r.logger.Error("stream loop failed, will reconnect",
+				slog.String("error", err.Error()),
+				slog.Duration("backoff", backoff),
+			)
+			r.closeConnection(ctx)
+			r.waitWithBackoff(ctx, backoff)
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		}
+		return nil
+	}
+}
+
+func (r *Reader) waitWithBackoff(ctx context.Context, backoff time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-r.shutdown:
+	case <-time.After(backoff):
+	}
+}
+
+func (r *Reader) closeConnection(ctx context.Context) {
+	if r.conn != nil {
+		_ = r.conn.Close(ctx)
+		r.conn = nil
+	}
 }
 
 func (r *Reader) connect(ctx context.Context) error {
@@ -138,9 +196,7 @@ func (r *Reader) setupReplication(ctx context.Context) error {
 		return fmt.Errorf("start replication failed: %w", err)
 	}
 
-	r.mu.Lock()
-	r.clientLSN = sysident.XLogPos
-	r.mu.Unlock()
+	r.clientLSN.Store(uint64(sysident.XLogPos))
 
 	r.logger.Info("replication started", slog.String("lsn", sysident.XLogPos.String()))
 	return nil
@@ -216,18 +272,14 @@ func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) 
 			eventsProcessed++
 		}
 
-		if result.LSN > r.clientLSN {
-			r.mu.Lock()
-			r.clientLSN = result.LSN
-			r.mu.Unlock()
+		if uint64(result.LSN) > r.clientLSN.Load() {
+			r.clientLSN.Store(uint64(result.LSN))
 		}
 	}
 }
 
 func (r *Reader) sendStandbyStatus(ctx context.Context) error {
-	r.mu.RLock()
-	lsn := r.clientLSN
-	r.mu.RUnlock()
+	lsn := pglogrepl.LSN(r.clientLSN.Load())
 
 	r.logger.Debug("sending standby status", slog.String("lsn", lsn.String()))
 
@@ -254,7 +306,5 @@ func (r *Reader) Stop(ctx context.Context) error {
 }
 
 func (r *Reader) CurrentLSN() string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.clientLSN.String()
+	return pglogrepl.LSN(r.clientLSN.Load()).String()
 }

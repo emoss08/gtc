@@ -1,11 +1,28 @@
 package wal
 
 import (
+	"sync"
+
 	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+var mapPool = sync.Pool{
+	New: func() any {
+		return make(map[string]any, 16)
+	},
+}
+
+func GetMap() map[string]any {
+	return mapPool.Get().(map[string]any)
+}
+
+func PutMap(m map[string]any) {
+	clear(m)
+	mapPool.Put(m)
+}
 
 type Decoder struct {
 	relations map[uint32]*pglogrepl.RelationMessageV2

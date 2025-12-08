@@ -8,6 +8,7 @@ import (
 
 	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/emoss08/gtc/internal/core/ports"
+	"github.com/sourcegraph/conc/pool"
 )
 
 type CDCServiceConfig struct {
@@ -167,15 +168,15 @@ func (s *cdcService) ProcessEvent(ctx context.Context, event domain.CDCEvent) []
 	}
 
 	if s.config.ParallelSinks {
-		var wg sync.WaitGroup
+		p := pool.New().WithContext(ctx)
 		for i, sink := range sinks {
-			wg.Add(1)
-			go func(idx int, snk domain.Sink) {
-				defer wg.Done()
+			idx, snk := i, sink
+			p.Go(func(ctx context.Context) error {
 				results[idx] = s.processSingleSink(ctx, snk, event)
-			}(i, sink)
+				return nil
+			})
 		}
-		wg.Wait()
+		_ = p.Wait()
 	} else {
 		for i, sink := range sinks {
 			results[i] = s.processSingleSink(ctx, sink, event)

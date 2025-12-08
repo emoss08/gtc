@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/json"
 	"os"
 	"strconv"
 	"strings"
@@ -9,7 +8,7 @@ import (
 )
 
 func Load() (*Config, error) {
-	return &Config{
+	cfg := &Config{
 		DatabaseURL:     getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/trenova_go_db?replication=database"),
 		SlotName:        getEnv("CDC_SLOT_NAME", "cdc_demo_slot"),
 		PublicationName: getEnv("CDC_PUBLICATION_NAME", "cdc_demo_publication"),
@@ -17,7 +16,21 @@ func Load() (*Config, error) {
 		ParallelSinks:   getBool("CDC_PARALLEL_SINKS", false),
 		ProcessTimeout:  getDuration("CDC_PROCESS_TIMEOUT", 30*time.Second),
 		ExcludedTables:  parseTableSet("CDC_EXCLUDED_TABLES"),
-	}, nil
+		HTTPPort:        getInt("HTTP_PORT", 8080),
+		Resilience: ResilienceConfig{
+			CircuitBreakerThreshold: getUint32("CDC_CIRCUIT_BREAKER_THRESHOLD", 5),
+			CircuitBreakerTimeout:   getDuration("CDC_CIRCUIT_BREAKER_TIMEOUT", 30*time.Second),
+			MaxRetries:              getInt("CDC_MAX_RETRIES", 3),
+			RetryBackoffInitial:     getDuration("CDC_RETRY_BACKOFF_INITIAL", 100*time.Millisecond),
+			RetryBackoffMax:         getDuration("CDC_RETRY_BACKOFF_MAX", 10*time.Second),
+		},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
 }
 
 func parseTableSet(key string) map[string]struct{} {
@@ -35,33 +48,6 @@ func parseTableSet(key string) map[string]struct{} {
 	}
 
 	return result
-}
-
-func LoadRedisConfig() RedisConfig {
-	cfg := RedisConfig{
-		URL:          os.Getenv("REDIS_URL"),
-		StreamPrefix: getEnv("REDIS_STREAM_PREFIX", "cdc"),
-		MaxStreamLen: getInt64("REDIS_MAX_STREAM_LEN", 10000),
-	}
-	cfg.Enabled = cfg.URL != ""
-	return cfg
-}
-
-func LoadMeilisearchConfig() (MeilisearchConfig, error) {
-	cfg := MeilisearchConfig{
-		URL:          os.Getenv("MEILISEARCH_URL"),
-		APIKey:       os.Getenv("MEILISEARCH_API_KEY"),
-		TableMapping: make(map[string]string),
-	}
-	cfg.Enabled = cfg.URL != ""
-
-	if mappingStr := os.Getenv("MEILISEARCH_TABLE_MAPPING"); mappingStr != "" {
-		if err := json.Unmarshal([]byte(mappingStr), &cfg.TableMapping); err != nil {
-			return cfg, err
-		}
-	}
-
-	return cfg, nil
 }
 
 func getEnv(key, defaultVal string) string {
@@ -92,6 +78,24 @@ func getInt64(key string, defaultVal int64) int64 {
 	if val := os.Getenv(key); val != "" {
 		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
 			return i
+		}
+	}
+	return defaultVal
+}
+
+func getInt(key string, defaultVal int) int {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.Atoi(val); err == nil {
+			return i
+		}
+	}
+	return defaultVal
+}
+
+func getUint32(key string, defaultVal uint32) uint32 {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.ParseUint(val, 10, 32); err == nil {
+			return uint32(i)
 		}
 	}
 	return defaultVal

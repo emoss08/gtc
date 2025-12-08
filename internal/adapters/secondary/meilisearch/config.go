@@ -1,30 +1,20 @@
 package meilisearch
 
 import (
-	"encoding/json"
 	"os"
 )
 
 type Config struct {
-	URL          string
-	APIKey       string
-	TableMapping map[string]string
-	Enabled      bool
+	URL     string
+	APIKey  string
+	Enabled bool
 }
 
-func LoadConfig() (Config, error) {
+func LoadConfig() Config {
 	cfg := Config{
-		URL:          os.Getenv("MEILISEARCH_URL"),
-		APIKey:       os.Getenv("MEILISEARCH_API_KEY"),
-		TableMapping: make(map[string]string),
+		URL:    os.Getenv("MEILISEARCH_URL"),
+		APIKey: os.Getenv("MEILISEARCH_API_KEY"),
 	}
 	cfg.Enabled = cfg.URL != ""
-
-	if mappingStr := os.Getenv("MEILISEARCH_TABLE_MAPPING"); mappingStr != "" {
-		if err := json.Unmarshal([]byte(mappingStr), &cfg.TableMapping); err != nil {
-			return cfg, err
-		}
-	}
-
-	return cfg, nil
+	return cfg
 }

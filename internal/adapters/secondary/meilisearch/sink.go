@@ -16,12 +16,20 @@ type Sink struct {
 	logger *slog.Logger
 }
 
-func NewSink(cfg Config, mapper *TableMapper, logger *slog.Logger) *Sink {
+var _ domain.Sink = (*Sink)(nil)
+
+type SinkParams struct {
+	Config Config
+	Mapper *TableMapper
+	Logger *slog.Logger
+}
+
+func NewSink(p SinkParams) *Sink {
 	return &Sink{
-		client: meilisearch.New(cfg.URL, meilisearch.WithAPIKey(cfg.APIKey)),
-		mapper: mapper,
-		config: cfg,
-		logger: logger.With(slog.String("component", "meilisearch_sink")),
+		client: meilisearch.New(p.Config.URL, meilisearch.WithAPIKey(p.Config.APIKey)),
+		mapper: p.Mapper,
+		config: p.Config,
+		logger: p.Logger.With(slog.String("component", "meilisearch_sink")),
 	}
 }
 
@@ -30,18 +38,14 @@ func (s *Sink) Name() string {
 }
 
 func (s *Sink) Initialize(ctx context.Context) error {
-	s.logger.Debug("initializing meilisearch sink",
-		slog.Int("table_mappings", len(s.config.TableMapping)),
-	)
+	s.logger.Debug("initializing meilisearch sink")
 
 	if _, err := s.client.Health(); err != nil {
 		s.logger.Error("failed to connect to meilisearch", slog.String("error", err.Error()))
 		return err
 	}
 
-	s.logger.Info("meilisearch sink initialized",
-		slog.Any("table_mappings", s.config.TableMapping),
-	)
+	s.logger.Info("meilisearch sink initialized")
 	return nil
 }
 

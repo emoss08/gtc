@@ -1,17 +1,23 @@
 package meilisearch
 
-type TableMapper struct {
-	mapping map[string]string
+type IndexResolver interface {
+	GetIndex(schema, table string) (string, bool)
 }
 
-func NewTableMapper(mapping map[string]string) *TableMapper {
-	return &TableMapper{mapping: mapping}
+type TableMapper struct {
+	resolver IndexResolver
+}
+
+type TableMapperParams struct {
+	Resolver IndexResolver
+}
+
+func NewTableMapper(p TableMapperParams) *TableMapper {
+	return &TableMapper{resolver: p.Resolver}
 }
 
 func (m *TableMapper) GetIndex(schema, table string) (string, bool) {
-	fullName := schema + "." + table
-	index, exists := m.mapping[fullName]
-	return index, exists
+	return m.resolver.GetIndex(schema, table)
 }
 
 func (m *TableMapper) ShouldProcess(schema, table string) bool {

@@ -2,79 +2,92 @@ package redis
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 
+	"github.com/bytedance/sonic"
 	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/redis/go-redis/v9"
 )
 
-type Sink struct {
-	client *redis.Client
-	config Config
-	logger *slog.Logger
+type StreamSink struct {
+	*BaseSink
+	maxStreamLen int64
 }
 
-func NewSink(cfg Config, logger *slog.Logger) (*Sink, error) {
-	opts, err := redis.ParseURL(cfg.URL)
+var _ domain.Sink = (*StreamSink)(nil)
+
+type StreamSinkParams struct {
+	Config      Config
+	KeyResolver *KeyResolver
+	Logger      *slog.Logger
+}
+
+func NewSink(p StreamSinkParams) (*StreamSink, error) {
+	base, err := NewBaseSink(BaseSinkParams{
+		Name: "redis-stream",
+		Config: BaseConfig{
+			URL:         p.Config.URL,
+			Prefix:      p.Config.StreamPrefix,
+			KeyResolver: p.KeyResolver,
+		},
+		Logger: p.Logger,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("invalid redis URL: %w", err)
+		return nil, err
 	}
 
-	return &Sink{
-		client: redis.NewClient(opts),
-		config: cfg,
-		logger: logger.With(slog.String("component", "redis_sink")),
+	return &StreamSink{
+		BaseSink:     base,
+		maxStreamLen: p.Config.MaxStreamLen,
 	}, nil
 }
 
-func (s *Sink) Name() string {
-	return "redis"
-}
-
-func (s *Sink) Initialize(ctx context.Context) error {
-	s.logger.Debug("initializing redis sink",
-		slog.String("stream_prefix", s.config.StreamPrefix),
-		slog.Int64("max_stream_len", s.config.MaxStreamLen),
+func (s *StreamSink) Initialize(ctx context.Context) error {
+	s.Logger.Debug("initializing redis stream sink",
+		slog.String("prefix", s.Config.Prefix),
+		slog.Int64("max_stream_len", s.maxStreamLen),
 	)
 
-	if err := s.client.Ping(ctx).Err(); err != nil {
-		s.logger.Error("failed to connect to redis", slog.String("error", err.Error()))
+	if err := s.Client.Ping(ctx).Err(); err != nil {
+		s.Logger.Error("failed to connect to redis", slog.String("error", err.Error()))
 		return err
 	}
 
-	s.logger.Info("redis sink initialized")
+	s.Logger.Info("redis stream sink initialized")
 	return nil
 }
 
-func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
-	streamKey := fmt.Sprintf("%s:%s:%s", s.config.StreamPrefix, event.Schema, event.Table)
+func (s *StreamSink) Process(ctx context.Context, event domain.CDCEvent) error {
+	streamKey, err := s.GenerateKey(event)
+	if err != nil {
+		return err
+	}
 
-	payload, err := json.Marshal(map[string]any{
+	payload, err := sonic.Marshal(map[string]any{
 		"operation": event.Operation.String(),
 		"old_data":  event.OldData,
 		"new_data":  event.NewData,
 		"metadata":  event.Metadata,
 	})
 	if err != nil {
-		s.logger.Error("failed to marshal payload",
+		s.Logger.Error("failed to marshal payload",
 			slog.String("error", err.Error()),
 			slog.String("event_id", event.ID),
 		)
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	if err := s.client.XAdd(ctx, &redis.XAddArgs{
+	if err := s.Client.XAdd(ctx, &redis.XAddArgs{
 		Stream: streamKey,
-		MaxLen: s.config.MaxStreamLen,
+		MaxLen: s.maxStreamLen,
 		Approx: true,
 		Values: map[string]any{
 			"event_id": event.ID,
 			"payload":  string(payload),
 		},
 	}).Err(); err != nil {
-		s.logger.Error("failed to add to stream",
+		s.Logger.Error("failed to add to stream",
 			slog.String("error", err.Error()),
 			slog.String("stream", streamKey),
 			slog.String("event_id", event.ID),
@@ -82,27 +95,11 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 		return err
 	}
 
-	s.logger.Debug("event added to stream",
+	s.Logger.Debug("event added to stream",
 		slog.String("stream", streamKey),
 		slog.String("event_id", event.ID),
 		slog.String("operation", event.Operation.String()),
 	)
 
 	return nil
-}
-
-func (s *Sink) Shutdown(ctx context.Context) error {
-	s.logger.Info("shutting down redis sink")
-
-	if err := s.client.Close(); err != nil {
-		s.logger.Error("failed to close redis connection", slog.String("error", err.Error()))
-		return err
-	}
-
-	s.logger.Info("redis sink shutdown complete")
-	return nil
-}
-
-func (s *Sink) HealthCheck(ctx context.Context) error {
-	return s.client.Ping(ctx).Err()
 }

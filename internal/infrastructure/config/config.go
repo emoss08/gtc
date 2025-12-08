@@ -1,6 +1,11 @@
 package config
 
-import "time"
+import (
+	"time"
+
+	validation "github.com/go-ozzo/ozzo-validation/v4"
+	"github.com/go-ozzo/ozzo-validation/v4/is"
+)
 
 type Config struct {
 	DatabaseURL     string
@@ -10,18 +15,36 @@ type Config struct {
 	ParallelSinks   bool
 	ProcessTimeout  time.Duration
 	ExcludedTables  map[string]struct{}
+	HTTPPort        int
+	Resilience      ResilienceConfig
 }
 
-type RedisConfig struct {
-	URL          string
-	StreamPrefix string
-	MaxStreamLen int64
-	Enabled      bool
+type ResilienceConfig struct {
+	CircuitBreakerThreshold uint32
+	CircuitBreakerTimeout   time.Duration
+	MaxRetries              int
+	RetryBackoffInitial     time.Duration
+	RetryBackoffMax         time.Duration
 }
 
-type MeilisearchConfig struct {
-	URL          string
-	APIKey       string
-	TableMapping map[string]string
-	Enabled      bool
+func (c Config) Validate() error {
+	return validation.ValidateStruct(&c,
+		validation.Field(&c.DatabaseURL, validation.Required, is.URL),
+		validation.Field(&c.SlotName, validation.Required),
+		validation.Field(&c.PublicationName, validation.Required),
+		validation.Field(&c.StandbyTimeout, validation.Required, validation.Min(time.Second)),
+		validation.Field(&c.ProcessTimeout, validation.Required, validation.Min(time.Second)),
+		validation.Field(&c.HTTPPort, validation.Required, validation.Min(1), validation.Max(65535)),
+		validation.Field(&c.Resilience),
+	)
+}
+
+func (c ResilienceConfig) Validate() error {
+	return validation.ValidateStruct(&c,
+		validation.Field(&c.CircuitBreakerThreshold, validation.Min(uint32(1))),
+		validation.Field(&c.CircuitBreakerTimeout, validation.Min(time.Second)),
+		validation.Field(&c.MaxRetries, validation.Min(0)),
+		validation.Field(&c.RetryBackoffInitial, validation.Min(time.Millisecond)),
+		validation.Field(&c.RetryBackoffMax, validation.Min(time.Millisecond)),
+	)
 }

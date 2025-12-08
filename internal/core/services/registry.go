@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/emoss08/gtc/internal/core/domain"
@@ -96,13 +97,13 @@ func (r *sinkRegistry) ShutdownAll(ctx context.Context) error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	var lastErr error
+	var errs []error
 	for _, sink := range r.sinks {
 		if err := sink.Shutdown(ctx); err != nil {
-			lastErr = err
+			errs = append(errs, err)
 		}
 	}
-	return lastErr
+	return errors.Join(errs...)
 }
 
 func (r *sinkRegistry) HealthCheckAll(ctx context.Context) map[string]error {
