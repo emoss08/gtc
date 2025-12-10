@@ -99,14 +99,20 @@ type PatternResolver interface {
 	GetKeyPattern(schema, table string) string
 }
 
+type TableFilter interface {
+	ShouldProcess(schema, table string) bool
+}
+
 type KeyResolver struct {
 	resolver       PatternResolver
+	filter         TableFilter
 	prefixTemplate *KeyTemplate
 	templateCache  map[string]*KeyTemplate
 }
 
 type KeyResolverParams struct {
 	Resolver PatternResolver
+	Filter   TableFilter
 	Prefix   string
 }
 
@@ -118,9 +124,17 @@ func NewKeyResolver(p KeyResolverParams) (*KeyResolver, error) {
 
 	return &KeyResolver{
 		resolver:       p.Resolver,
+		filter:         p.Filter,
 		prefixTemplate: prefixTmpl,
 		templateCache:  make(map[string]*KeyTemplate),
 	}, nil
+}
+
+func (kr *KeyResolver) ShouldProcess(schema, table string) bool {
+	if kr.filter == nil {
+		return true
+	}
+	return kr.filter.ShouldProcess(schema, table)
 }
 
 func (kr *KeyResolver) GenerateKey(event domain.CDCEvent) (string, error) {

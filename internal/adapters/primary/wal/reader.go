@@ -14,12 +14,16 @@ import (
 )
 
 type Config struct {
-	DatabaseURL        string
-	SlotName           string
-	PublicationName    string
-	StandbyTimeout     time.Duration
-	ReconnectBackoff   time.Duration
+	DatabaseURL         string
+	SlotName            string
+	PublicationName     string
+	StandbyTimeout      time.Duration
+	ReconnectBackoff    time.Duration
 	MaxReconnectBackoff time.Duration
+	AutoCreateSlot      bool
+	AutoCreatePub       bool
+	SlotRetryInterval   time.Duration
+	SlotRetryTimeout    time.Duration
 }
 
 type Reader struct {
@@ -146,35 +150,105 @@ func (r *Reader) setupReplication(ctx context.Context) error {
 		slog.String("db_name", sysident.DBName),
 	)
 
-	r.logger.Debug("dropping existing publication", slog.String("publication", r.config.PublicationName))
-	result := r.conn.Exec(ctx, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", r.config.PublicationName))
-	if _, err = result.ReadAll(); err != nil {
-		return fmt.Errorf("drop publication failed: %w", err)
+	if err := r.ensurePublication(ctx); err != nil {
+		return err
 	}
 
-	r.logger.Debug("creating publication", slog.String("publication", r.config.PublicationName))
-	result = r.conn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES", r.config.PublicationName))
+	startLSN, err := r.ensureReplicationSlot(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := r.startReplicationWithRetry(ctx, startLSN); err != nil {
+		return err
+	}
+
+	r.clientLSN.Store(uint64(startLSN))
+	r.logger.Info("replication started", slog.String("lsn", startLSN.String()))
+	return nil
+}
+
+func (r *Reader) ensurePublication(ctx context.Context) error {
+	checkResult := r.conn.Exec(ctx, fmt.Sprintf(
+		"SELECT 1 FROM pg_publication WHERE pubname = '%s'",
+		r.config.PublicationName,
+	))
+	rows, err := checkResult.ReadAll()
+	if err != nil {
+		return fmt.Errorf("check publication failed: %w", err)
+	}
+
+	if len(rows) > 0 && len(rows[0].Rows) > 0 {
+		r.logger.Info("publication exists", slog.String("publication", r.config.PublicationName))
+		return nil
+	}
+
+	if !r.config.AutoCreatePub {
+		return fmt.Errorf("publication %q does not exist and auto-create is disabled", r.config.PublicationName)
+	}
+
+	r.logger.Info("creating publication", slog.String("publication", r.config.PublicationName))
+	result := r.conn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES", r.config.PublicationName))
 	if _, err = result.ReadAll(); err != nil {
 		return fmt.Errorf("create publication failed: %w", err)
 	}
-	r.logger.Info("publication created", slog.String("publication", r.config.PublicationName))
 
-	r.logger.Debug("creating replication slot",
-		slog.String("slot_name", r.config.SlotName),
-		slog.Bool("temporary", true),
-	)
-	_, err = pglogrepl.CreateReplicationSlot(
+	r.logger.Info("publication created", slog.String("publication", r.config.PublicationName))
+	return nil
+}
+
+func (r *Reader) ensureReplicationSlot(ctx context.Context) (pglogrepl.LSN, error) {
+	checkResult := r.conn.Exec(ctx, fmt.Sprintf(
+		"SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = '%s'",
+		r.config.SlotName,
+	))
+	rows, err := checkResult.ReadAll()
+	if err != nil {
+		return 0, fmt.Errorf("check replication slot failed: %w", err)
+	}
+
+	if len(rows) > 0 && len(rows[0].Rows) > 0 && len(rows[0].Rows[0]) > 0 {
+		lsnStr := string(rows[0].Rows[0][0])
+		startLSN, parseErr := pglogrepl.ParseLSN(lsnStr)
+		if parseErr != nil {
+			return 0, fmt.Errorf("parse confirmed_flush_lsn failed: %w", parseErr)
+		}
+		r.logger.Info("replication slot exists",
+			slog.String("slot_name", r.config.SlotName),
+			slog.String("confirmed_flush_lsn", startLSN.String()),
+		)
+		return startLSN, nil
+	}
+
+	if !r.config.AutoCreateSlot {
+		return 0, fmt.Errorf("replication slot %q does not exist and auto-create is disabled", r.config.SlotName)
+	}
+
+	r.logger.Info("creating replication slot", slog.String("slot_name", r.config.SlotName))
+	slotResult, err := pglogrepl.CreateReplicationSlot(
 		ctx,
 		r.conn,
 		r.config.SlotName,
 		"pgoutput",
-		pglogrepl.CreateReplicationSlotOptions{Temporary: true},
+		pglogrepl.CreateReplicationSlotOptions{Temporary: false},
 	)
 	if err != nil {
-		return fmt.Errorf("create replication slot failed: %w", err)
+		return 0, fmt.Errorf("create replication slot failed: %w", err)
 	}
-	r.logger.Info("replication slot created", slog.String("slot_name", r.config.SlotName))
 
+	startLSN, err := pglogrepl.ParseLSN(slotResult.ConsistentPoint)
+	if err != nil {
+		return 0, fmt.Errorf("parse consistent_point failed: %w", err)
+	}
+
+	r.logger.Info("replication slot created",
+		slog.String("slot_name", r.config.SlotName),
+		slog.String("consistent_point", startLSN.String()),
+	)
+	return startLSN, nil
+}
+
+func (r *Reader) startReplicationWithRetry(ctx context.Context, startLSN pglogrepl.LSN) error {
 	pluginArguments := []string{
 		"proto_version '2'",
 		fmt.Sprintf("publication_names '%s'", r.config.PublicationName),
@@ -182,24 +256,37 @@ func (r *Reader) setupReplication(ctx context.Context) error {
 		"streaming 'true'",
 	}
 
-	r.logger.Debug("starting replication",
-		slog.String("start_lsn", sysident.XLogPos.String()),
-	)
-	err = pglogrepl.StartReplication(
-		ctx,
-		r.conn,
-		r.config.SlotName,
-		sysident.XLogPos,
-		pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments},
-	)
-	if err != nil {
-		return fmt.Errorf("start replication failed: %w", err)
+	deadline := time.Now().Add(r.config.SlotRetryTimeout)
+
+	for {
+		r.logger.Debug("starting replication", slog.String("start_lsn", startLSN.String()))
+
+		err := pglogrepl.StartReplication(
+			ctx,
+			r.conn,
+			r.config.SlotName,
+			startLSN,
+			pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments},
+		)
+		if err == nil {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("start replication failed after timeout: %w", err)
+		}
+
+		r.logger.Warn("replication slot busy, retrying",
+			slog.String("error", err.Error()),
+			slog.Duration("retry_in", r.config.SlotRetryInterval),
+		)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(r.config.SlotRetryInterval):
+		}
 	}
-
-	r.clientLSN.Store(uint64(sysident.XLogPos))
-
-	r.logger.Info("replication started", slog.String("lsn", sysident.XLogPos.String()))
-	return nil
 }
 
 func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) error {
@@ -209,7 +296,10 @@ func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) 
 	for {
 		select {
 		case <-r.shutdown:
-			r.logger.Info("shutdown signal received", slog.Int64("events_processed", eventsProcessed))
+			r.logger.Info(
+				"shutdown signal received",
+				slog.Int64("events_processed", eventsProcessed),
+			)
 			return nil
 		case <-ctx.Done():
 			r.logger.Info("context cancelled", slog.Int64("events_processed", eventsProcessed))

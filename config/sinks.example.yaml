@@ -1,17 +1,16 @@
 redis_stream:
+  sync_all: true
   default_key_pattern: "{{.Prefix}}:{{.Schema}}:{{.Table}}"
   tables:
-    public.audit_logs: "{{.Prefix}}:audit:{{.Field \"entity_type\"}}"
+    public.orders: "{{.Prefix}}:orders:{{.Field \"status\"}}"
 
 redis_json:
   default_key_pattern: "{{.Prefix}}:{{.Schema}}:{{.Table}}:{{.Field \"id\"}}"
   tables:
     public.users: "{{.Prefix}}:users:{{.Field \"id\"}}"
     public.orders: "{{.Prefix}}:orders:{{.Field \"customer_id\"}}:{{.Field \"id\"}}"
-    public.sessions: "{{.Prefix}}:sessions:{{.Field \"token\"}}"
 
 meilisearch:
   tables:
     public.products: products
     public.users: users
-    public.orders: orders

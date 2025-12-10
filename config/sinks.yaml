@@ -1,15 +1,15 @@
 redis_stream:
   default_key_pattern: "{{.Prefix}}:{{.Schema}}:{{.Table}}"
   tables:
-    public.us_states: '{{.Prefix}}:{{.Field "id"}}'
+    public.shipments: '{{.Prefix}}:{{.Field "id"}}'
 
 redis_json:
   default_key_pattern: '{{.Prefix}}:{{.Schema}}:{{.Table}}:{{.Field "id"}}'
   tables:
     public.us_states: 'us_states:{{.Field "id"}}'
+    public.organizations: 'organizations:{{.Field "id"}}'
 
 meilisearch:
   tables:
-    # public.products: products
     public.us_states: us_states
-    # public.orders: orders
+    public.customers: customers

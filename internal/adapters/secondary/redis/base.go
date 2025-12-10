@@ -76,6 +76,10 @@ func (s *BaseSink) HealthCheck(ctx context.Context) error {
 	return s.Client.Ping(ctx).Err()
 }
 
+func (s *BaseSink) ShouldProcess(event domain.CDCEvent) bool {
+	return s.Config.KeyResolver.ShouldProcess(event.Schema, event.Table)
+}
+
 func (s *BaseSink) GenerateKey(event domain.CDCEvent) (string, error) {
 	key, err := s.Config.KeyResolver.GenerateKey(event)
 	if err != nil {

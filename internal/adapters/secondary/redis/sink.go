@@ -59,6 +59,14 @@ func (s *StreamSink) Initialize(ctx context.Context) error {
 }
 
 func (s *StreamSink) Process(ctx context.Context, event domain.CDCEvent) error {
+	if !s.ShouldProcess(event) {
+		s.Logger.Debug("skipping event, table not configured",
+			slog.String("table", event.FullTableName()),
+			slog.String("event_id", event.ID),
+		)
+		return nil
+	}
+
 	streamKey, err := s.GenerateKey(event)
 	if err != nil {
 		return err

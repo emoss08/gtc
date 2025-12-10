@@ -14,13 +14,41 @@ type SinksConfig struct {
 }
 
 type RedisStreamSinkConfig struct {
+	SyncAll           bool              `yaml:"sync_all"`
 	DefaultKeyPattern string            `yaml:"default_key_pattern"`
 	Tables            map[string]string `yaml:"tables"`
 }
 
 type RedisJSONSinkConfig struct {
+	SyncAll           bool              `yaml:"sync_all"`
 	DefaultKeyPattern string            `yaml:"default_key_pattern"`
 	Tables            map[string]string `yaml:"tables"`
+}
+
+func (c *RedisStreamSinkConfig) ShouldProcess(schema, table string) bool {
+	fullName := fmt.Sprintf("%s.%s", schema, table)
+
+	if _, ok := c.Tables[fullName]; ok {
+		return true
+	}
+	if _, ok := c.Tables[table]; ok {
+		return true
+	}
+
+	return c.SyncAll
+}
+
+func (c *RedisJSONSinkConfig) ShouldProcess(schema, table string) bool {
+	fullName := fmt.Sprintf("%s.%s", schema, table)
+
+	if _, ok := c.Tables[fullName]; ok {
+		return true
+	}
+	if _, ok := c.Tables[table]; ok {
+		return true
+	}
+
+	return c.SyncAll
 }
 
 type MeilisearchSinkConfig struct {
@@ -99,8 +127,8 @@ func LoadSinksConfig() (*SinksConfig, error) {
 	}
 
 	var cfg SinksConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse sinks config: %w", err)
+	if unmarshalErr := yaml.Unmarshal(data, &cfg); unmarshalErr != nil {
+		return nil, fmt.Errorf("parse sinks config: %w", unmarshalErr)
 	}
 
 	if cfg.RedisStream.Tables == nil {

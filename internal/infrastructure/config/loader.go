@@ -9,14 +9,21 @@ import (
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		DatabaseURL:     getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/trenova_go_db?replication=database"),
-		SlotName:        getEnv("CDC_SLOT_NAME", "cdc_demo_slot"),
-		PublicationName: getEnv("CDC_PUBLICATION_NAME", "cdc_demo_publication"),
-		StandbyTimeout:  getDuration("CDC_STANDBY_TIMEOUT", 10*time.Second),
-		ParallelSinks:   getBool("CDC_PARALLEL_SINKS", false),
-		ProcessTimeout:  getDuration("CDC_PROCESS_TIMEOUT", 30*time.Second),
-		ExcludedTables:  parseTableSet("CDC_EXCLUDED_TABLES"),
-		HTTPPort:        getInt("HTTP_PORT", 8080),
+		DatabaseURL: getEnv(
+			"DATABASE_URL",
+			"postgres://postgres:postgres@localhost:5432/trenova_go_db?replication=database",
+		),
+		SlotName:          getEnv("CDC_SLOT_NAME", "cdc_demo_slot"),
+		PublicationName:   getEnv("CDC_PUBLICATION_NAME", "cdc_demo_publication"),
+		StandbyTimeout:    getDuration("CDC_STANDBY_TIMEOUT", 10*time.Second),
+		ParallelSinks:     getBool("CDC_PARALLEL_SINKS", false),
+		ProcessTimeout:    getDuration("CDC_PROCESS_TIMEOUT", 30*time.Second),
+		ExcludedTables:    parseTableSet("CDC_EXCLUDED_TABLES"),
+		HTTPPort:          getInt("HTTP_PORT", 8080),
+		AutoCreateSlot:    getBool("CDC_AUTO_CREATE_SLOT", true),
+		AutoCreatePub:     getBool("CDC_AUTO_CREATE_PUBLICATION", true),
+		SlotRetryInterval: getDuration("CDC_SLOT_RETRY_INTERVAL", 5*time.Second),
+		SlotRetryTimeout:  getDuration("CDC_SLOT_RETRY_TIMEOUT", 60*time.Second),
 		Resilience: ResilienceConfig{
 			CircuitBreakerThreshold: getUint32("CDC_CIRCUIT_BREAKER_THRESHOLD", 5),
 			CircuitBreakerTimeout:   getDuration("CDC_CIRCUIT_BREAKER_TIMEOUT", 30*time.Second),

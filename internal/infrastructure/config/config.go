@@ -8,15 +8,19 @@ import (
 )
 
 type Config struct {
-	DatabaseURL     string
-	SlotName        string
-	PublicationName string
-	StandbyTimeout  time.Duration
-	ParallelSinks   bool
-	ProcessTimeout  time.Duration
-	ExcludedTables  map[string]struct{}
-	HTTPPort        int
-	Resilience      ResilienceConfig
+	DatabaseURL       string
+	SlotName          string
+	PublicationName   string
+	StandbyTimeout    time.Duration
+	ParallelSinks     bool
+	ProcessTimeout    time.Duration
+	ExcludedTables    map[string]struct{}
+	HTTPPort          int
+	Resilience        ResilienceConfig
+	AutoCreateSlot    bool
+	AutoCreatePub     bool
+	SlotRetryInterval time.Duration
+	SlotRetryTimeout  time.Duration
 }
 
 type ResilienceConfig struct {
@@ -28,13 +32,19 @@ type ResilienceConfig struct {
 }
 
 func (c Config) Validate() error {
-	return validation.ValidateStruct(&c,
+	return validation.ValidateStruct(
+		&c,
 		validation.Field(&c.DatabaseURL, validation.Required, is.URL),
 		validation.Field(&c.SlotName, validation.Required),
 		validation.Field(&c.PublicationName, validation.Required),
 		validation.Field(&c.StandbyTimeout, validation.Required, validation.Min(time.Second)),
 		validation.Field(&c.ProcessTimeout, validation.Required, validation.Min(time.Second)),
-		validation.Field(&c.HTTPPort, validation.Required, validation.Min(1), validation.Max(65535)),
+		validation.Field(
+			&c.HTTPPort,
+			validation.Required,
+			validation.Min(1),
+			validation.Max(65535),
+		),
 		validation.Field(&c.Resilience),
 	)
 }

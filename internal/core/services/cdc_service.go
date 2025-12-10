@@ -186,7 +186,11 @@ func (s *cdcService) ProcessEvent(ctx context.Context, event domain.CDCEvent) []
 	return results
 }
 
-func (s *cdcService) processSingleSink(ctx context.Context, sink domain.Sink, event domain.CDCEvent) domain.SinkResult {
+func (s *cdcService) processSingleSink(
+	ctx context.Context,
+	sink domain.Sink,
+	event domain.CDCEvent,
+) domain.SinkResult {
 	start := time.Now()
 
 	ctx, cancel := context.WithTimeout(ctx, s.config.ProcessTimeout)

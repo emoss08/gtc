@@ -42,6 +42,14 @@ func NewSink(p JSONSinkParams) (*JSONSink, error) {
 }
 
 func (s *JSONSink) Process(ctx context.Context, event domain.CDCEvent) error {
+	if !s.ShouldProcess(event) {
+		s.Logger.Debug("skipping event, table not configured",
+			slog.String("table", event.FullTableName()),
+			slog.String("event_id", event.ID),
+		)
+		return nil
+	}
+
 	key, err := s.GenerateKey(event)
 	if err != nil {
 		return err

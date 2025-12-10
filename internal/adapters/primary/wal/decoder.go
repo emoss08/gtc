@@ -164,7 +164,10 @@ func (d *Decoder) decodeWALData(walData []byte, lsn pglogrepl.LSN) ([]domain.CDC
 	return events, nil
 }
 
-func (d *Decoder) decodeTuple(tuple *pglogrepl.TupleData, rel *pglogrepl.RelationMessageV2) map[string]any {
+func (d *Decoder) decodeTuple(
+	tuple *pglogrepl.TupleData,
+	rel *pglogrepl.RelationMessageV2,
+) map[string]any {
 	if tuple == nil {
 		return nil
 	}
