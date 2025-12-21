@@ -11,5 +11,4 @@ redis_json:
 
 meilisearch:
   tables:
-    public.us_states: us_states
     public.customers: customers

@@ -184,11 +184,17 @@ func (r *Reader) ensurePublication(ctx context.Context) error {
 	}
 
 	if !r.config.AutoCreatePub {
-		return fmt.Errorf("publication %q does not exist and auto-create is disabled", r.config.PublicationName)
+		return fmt.Errorf(
+			"publication %q does not exist and auto-create is disabled",
+			r.config.PublicationName,
+		)
 	}
 
 	r.logger.Info("creating publication", slog.String("publication", r.config.PublicationName))
-	result := r.conn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES", r.config.PublicationName))
+	result := r.conn.Exec(
+		ctx,
+		fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES", r.config.PublicationName),
+	)
 	if _, err = result.ReadAll(); err != nil {
 		return fmt.Errorf("create publication failed: %w", err)
 	}
@@ -221,7 +227,10 @@ func (r *Reader) ensureReplicationSlot(ctx context.Context) (pglogrepl.LSN, erro
 	}
 
 	if !r.config.AutoCreateSlot {
-		return 0, fmt.Errorf("replication slot %q does not exist and auto-create is disabled", r.config.SlotName)
+		return 0, fmt.Errorf(
+			"replication slot %q does not exist and auto-create is disabled",
+			r.config.SlotName,
+		)
 	}
 
 	r.logger.Info("creating replication slot", slog.String("slot_name", r.config.SlotName))
