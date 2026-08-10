@@ -1,3 +1,23 @@
+# Per-table sink routing and transforms. Set SINK_CONFIG_FILE to this file's
+# path. Without a config file, both Redis sinks mirror every table with
+# default key patterns and no transforms.
+#
+# Table entries take two forms:
+#   - a plain string: the key pattern (Redis sinks) or index name (Meilisearch)
+#   - an object: key/index plus declarative transforms
+#
+# Transforms (per sink under `transform:`, or per table):
+#   filter:       CEL expression; the event is delivered only when it is true.
+#                 Variables: op ("INSERT"|"UPDATE"|"DELETE"|"TRUNCATE"|"READ"),
+#                 schema, table, new (row data), old (previous data).
+#                 Guard optional columns: '"status" in new && new.status == "live"'
+#   drop_columns: removed from the event before the sink sees it
+#   mask:         column -> strategy: redact | null | sha256 | last4
+#
+# Transforms are per sink: the stream sink can carry full rows while the
+# search index receives masked ones. Masking runs before key generation, so
+# don't build keys from masked columns.
+
 redis_stream:
   sync_all: true
   default_key_pattern: "{{.Prefix}}:{{.Schema}}:{{.Table}}"
@@ -6,11 +26,24 @@ redis_stream:
 
 redis_json:
   default_key_pattern: "{{.Prefix}}:{{.Schema}}:{{.Table}}:{{.Field \"id\"}}"
+  transform:
+    drop_columns: [password_hash]
   tables:
-    public.users: "{{.Prefix}}:users:{{.Field \"id\"}}"
-    public.orders: "{{.Prefix}}:orders:{{.Field \"customer_id\"}}:{{.Field \"id\"}}"
+    public.users:
+      key: "{{.Prefix}}:users:{{.Field \"id\"}}"
+      mask:
+        email: sha256
+        phone: last4
+    public.orders:
+      key: "{{.Prefix}}:orders:{{.Field \"id\"}}"
+      filter: 'new.status != "draft"'
 
 meilisearch:
+  transform:
+    drop_columns: [password_hash, internal_notes]
   tables:
     public.products: products
-    public.users: users
+    public.users:
+      index: users
+      mask:
+        email: redact

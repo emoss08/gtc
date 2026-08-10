@@ -102,6 +102,15 @@ var (
 		},
 	)
 
+	EventsFiltered = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "cdc",
+			Name:      "events_filtered_total",
+			Help:      "Events excluded by a per-sink transform filter",
+		},
+		[]string{"sink", "schema", "table"},
+	)
+
 	BackfillRowsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "cdc",

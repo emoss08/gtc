@@ -3,7 +3,14 @@ package config
 import (
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
+
+func yamlUnmarshal(t *testing.T, input string, out any) error {
+	t.Helper()
+	return yaml.Unmarshal([]byte(input), out)
+}
 
 func TestGetBoolFallsBackOnInvalidInput(t *testing.T) {
 	t.Setenv("TEST_BOOL", "yes") // not valid for strconv.ParseBool
@@ -46,9 +53,9 @@ func TestRedisKeyedSinkConfig(t *testing.T) {
 	cfg := RedisKeyedSinkConfig{
 		SyncAll:           false,
 		DefaultKeyPattern: "default-pattern",
-		Tables: map[string]string{
-			"public.orders": "orders-pattern",
-			"events":        "events-pattern",
+		Tables: map[string]RedisTableConfig{
+			"public.orders": {Key: "orders-pattern"},
+			"events":        {Key: "events-pattern"},
 		},
 	}
 
@@ -72,6 +79,69 @@ func TestRedisKeyedSinkConfig(t *testing.T) {
 	}
 	if got := cfg.GetKeyPattern("public", "users"); got != "default-pattern" {
 		t.Errorf("expected default-pattern, got %q", got)
+	}
+}
+
+func TestSinkTableConfigYAMLShapes(t *testing.T) {
+	input := `
+redis_json:
+  transform:
+    mask:
+      email: sha256
+  tables:
+    public.users: "cdc:users:{{.Field \"id\"}}"
+    public.orders:
+      key: "cdc:orders:{{.Field \"id\"}}"
+      filter: 'new.status != "draft"'
+      drop_columns: [internal_notes]
+      mask:
+        card_number: last4
+meilisearch:
+  tables:
+    public.products: products
+    public.users:
+      index: users
+      drop_columns: [password_hash]
+`
+	var cfg SinksConfig
+	if err := yamlUnmarshal(t, input, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Plain string stays a bare key pattern.
+	if got := cfg.RedisJSON.GetKeyPattern("public", "users"); got != `cdc:users:{{.Field "id"}}` {
+		t.Errorf("string-form table: unexpected key pattern %q", got)
+	}
+
+	// Object form carries key + transforms.
+	orders := cfg.RedisJSON.Tables["public.orders"]
+	if orders.Key != `cdc:orders:{{.Field "id"}}` {
+		t.Errorf("object-form table: unexpected key %q", orders.Key)
+	}
+	if orders.Filter != `new.status != "draft"` {
+		t.Errorf("unexpected filter %q", orders.Filter)
+	}
+	if len(orders.DropColumns) != 1 || orders.DropColumns[0] != "internal_notes" {
+		t.Errorf("unexpected drop_columns %v", orders.DropColumns)
+	}
+	if orders.Mask["card_number"] != "last4" {
+		t.Errorf("unexpected mask %v", orders.Mask)
+	}
+
+	// Sink-level transform block.
+	if cfg.RedisJSON.Transform == nil || cfg.RedisJSON.Transform.Mask["email"] != "sha256" {
+		t.Errorf("sink-level transform not parsed: %+v", cfg.RedisJSON.Transform)
+	}
+
+	// Meilisearch string and object forms.
+	if idx, ok := cfg.Meilisearch.GetIndex("public", "products"); !ok || idx != "products" {
+		t.Errorf("string-form index: got %q ok=%v", idx, ok)
+	}
+	if idx, ok := cfg.Meilisearch.GetIndex("public", "users"); !ok || idx != "users" {
+		t.Errorf("object-form index: got %q ok=%v", idx, ok)
+	}
+	if tt := cfg.Meilisearch.TableTransforms(); len(tt["public.users"].DropColumns) != 1 {
+		t.Errorf("meilisearch table transforms not collected: %+v", tt)
 	}
 }
 

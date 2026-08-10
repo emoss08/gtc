@@ -13,12 +13,47 @@ type SinksConfig struct {
 	Meilisearch MeilisearchSinkConfig `yaml:"meilisearch"`
 }
 
+// TransformSpec declares per-event transformations applied before a sink
+// processes an event: a CEL row filter, column removal, and column masking.
+type TransformSpec struct {
+	// Filter is a CEL expression; the event is processed only when it
+	// evaluates to true. Variables: op, schema, table, new, old.
+	Filter string `yaml:"filter"`
+	// DropColumns are removed from the event's data before it reaches the
+	// sink (e.g. password_hash).
+	DropColumns []string `yaml:"drop_columns"`
+	// Mask maps column names to a masking strategy: redact, null, sha256,
+	// or last4.
+	Mask map[string]string `yaml:"mask"`
+}
+
+func (t TransformSpec) IsZero() bool {
+	return t.Filter == "" && len(t.DropColumns) == 0 && len(t.Mask) == 0
+}
+
+// RedisTableConfig is the per-table entry for a Redis-backed sink. In YAML it
+// is either a plain string (the key pattern, kept for backward compatibility)
+// or an object with a key pattern and transforms.
+type RedisTableConfig struct {
+	Key           string `yaml:"key"`
+	TransformSpec `yaml:",inline"`
+}
+
+func (c *RedisTableConfig) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		return node.Decode(&c.Key)
+	}
+	type raw RedisTableConfig
+	return node.Decode((*raw)(c))
+}
+
 // RedisKeyedSinkConfig configures a Redis-backed sink whose keys are built
 // from a per-table key pattern. It is shared by the stream and JSON sinks.
 type RedisKeyedSinkConfig struct {
-	SyncAll           bool              `yaml:"sync_all"`
-	DefaultKeyPattern string            `yaml:"default_key_pattern"`
-	Tables            map[string]string `yaml:"tables"`
+	SyncAll           bool                        `yaml:"sync_all"`
+	DefaultKeyPattern string                      `yaml:"default_key_pattern"`
+	Transform         *TransformSpec              `yaml:"transform"`
+	Tables            map[string]RedisTableConfig `yaml:"tables"`
 }
 
 func (c *RedisKeyedSinkConfig) ShouldProcess(schema, table string) bool {
@@ -39,33 +74,71 @@ func (c *RedisKeyedSinkConfig) ShouldProcess(schema, table string) bool {
 func (c *RedisKeyedSinkConfig) GetKeyPattern(schema, table string) string {
 	fullName := fmt.Sprintf("%s.%s", schema, table)
 
-	if pattern, ok := c.Tables[fullName]; ok {
-		return pattern
+	if tc, ok := c.Tables[fullName]; ok && tc.Key != "" {
+		return tc.Key
 	}
 
-	if pattern, ok := c.Tables[table]; ok {
-		return pattern
+	if tc, ok := c.Tables[table]; ok && tc.Key != "" {
+		return tc.Key
 	}
 
 	return c.DefaultKeyPattern
 }
 
+// TableTransforms returns the per-table transform specs keyed by the table
+// name as written in the config.
+func (c *RedisKeyedSinkConfig) TableTransforms() map[string]TransformSpec {
+	out := make(map[string]TransformSpec)
+	for name, tc := range c.Tables {
+		if !tc.TransformSpec.IsZero() {
+			out[name] = tc.TransformSpec
+		}
+	}
+	return out
+}
+
+// MeiliTableConfig is the per-table entry for the Meilisearch sink: either a
+// plain string (the index name) or an object with an index and transforms.
+type MeiliTableConfig struct {
+	Index         string `yaml:"index"`
+	TransformSpec `yaml:",inline"`
+}
+
+func (c *MeiliTableConfig) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		return node.Decode(&c.Index)
+	}
+	type raw MeiliTableConfig
+	return node.Decode((*raw)(c))
+}
+
 type MeilisearchSinkConfig struct {
-	Tables map[string]string `yaml:"tables"`
+	Transform *TransformSpec              `yaml:"transform"`
+	Tables    map[string]MeiliTableConfig `yaml:"tables"`
 }
 
 func (c *MeilisearchSinkConfig) GetIndex(schema, table string) (string, bool) {
 	fullName := fmt.Sprintf("%s.%s", schema, table)
 
-	if index, ok := c.Tables[fullName]; ok {
-		return index, true
+	if tc, ok := c.Tables[fullName]; ok {
+		return tc.Index, tc.Index != ""
 	}
 
-	if index, ok := c.Tables[table]; ok {
-		return index, true
+	if tc, ok := c.Tables[table]; ok {
+		return tc.Index, tc.Index != ""
 	}
 
 	return "", false
+}
+
+func (c *MeilisearchSinkConfig) TableTransforms() map[string]TransformSpec {
+	out := make(map[string]TransformSpec)
+	for name, tc := range c.Tables {
+		if !tc.TransformSpec.IsZero() {
+			out[name] = tc.TransformSpec
+		}
+	}
+	return out
 }
 
 func LoadSinksConfig() (*SinksConfig, error) {
@@ -83,13 +156,13 @@ func LoadSinksConfig() (*SinksConfig, error) {
 	}
 
 	if cfg.RedisStream.Tables == nil {
-		cfg.RedisStream.Tables = make(map[string]string)
+		cfg.RedisStream.Tables = make(map[string]RedisTableConfig)
 	}
 	if cfg.RedisJSON.Tables == nil {
-		cfg.RedisJSON.Tables = make(map[string]string)
+		cfg.RedisJSON.Tables = make(map[string]RedisTableConfig)
 	}
 	if cfg.Meilisearch.Tables == nil {
-		cfg.Meilisearch.Tables = make(map[string]string)
+		cfg.Meilisearch.Tables = make(map[string]MeiliTableConfig)
 	}
 
 	// Plug-and-play default: with no sink config file, mirror every table.
