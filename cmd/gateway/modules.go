@@ -18,6 +18,7 @@ import (
 	"github.com/emoss08/gtc/internal/infrastructure/config"
 	"github.com/emoss08/gtc/internal/infrastructure/resilience"
 	"github.com/emoss08/gtc/internal/infrastructure/server"
+	"github.com/emoss08/gtc/internal/infrastructure/transform"
 	"go.uber.org/fx"
 )
 
@@ -123,6 +124,23 @@ func newSinks(
 
 	var sinks []domain.Sink
 
+	// Each sink is wrapped resilience-first, then transforms, so retries
+	// operate on the already-transformed event and a filter/mask error is
+	// not treated as a sink failure by the circuit breaker.
+	addSink := func(
+		sink domain.Sink,
+		global *config.TransformSpec,
+		tables map[string]config.TransformSpec,
+	) error {
+		wrapped, err := transform.NewSink(
+			resilience.NewResilientSink(sink, resCfg), global, tables, logger)
+		if err != nil {
+			return err
+		}
+		sinks = append(sinks, wrapped)
+		return nil
+	}
+
 	if rc := redissink.LoadConfig(); rc.Enabled {
 		resolver, err := redissink.NewKeyResolver(redissink.KeyResolverParams{
 			Resolver:       &sinksCfg.RedisStream,
@@ -141,7 +159,9 @@ func newSinks(
 		if err != nil {
 			return nil, err
 		}
-		sinks = append(sinks, resilience.NewResilientSink(sink, resCfg))
+		if err := addSink(sink, sinksCfg.RedisStream.Transform, sinksCfg.RedisStream.TableTransforms()); err != nil {
+			return nil, err
+		}
 	}
 
 	if jc := redisjsonsink.LoadConfig(); jc.Enabled {
@@ -162,7 +182,9 @@ func newSinks(
 		if err != nil {
 			return nil, err
 		}
-		sinks = append(sinks, resilience.NewResilientSink(sink, resCfg))
+		if err := addSink(sink, sinksCfg.RedisJSON.Transform, sinksCfg.RedisJSON.TableTransforms()); err != nil {
+			return nil, err
+		}
 	}
 
 	if mc := meilisink.LoadConfig(); mc.Enabled {
@@ -174,7 +196,9 @@ func newSinks(
 			Mapper: mapper,
 			Logger: logger,
 		})
-		sinks = append(sinks, resilience.NewResilientSink(sink, resCfg))
+		if err := addSink(sink, sinksCfg.Meilisearch.Transform, sinksCfg.Meilisearch.TableTransforms()); err != nil {
+			return nil, err
+		}
 	}
 
 	return sinks, nil

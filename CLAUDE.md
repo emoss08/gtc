@@ -81,6 +81,13 @@ The Meilisearch sink only indexes tables mapped in `SINK_CONFIG_FILE` under
 identity columns (normally the primary key); other columns are absent from
 DELETE events, which would make the delete target the wrong key.
 
+Sink YAML also carries declarative transforms (per sink `transform:` block
+and per-table object entries): CEL `filter` expressions (variables op,
+schema, table, new, old), `drop_columns`, and `mask` strategies (redact,
+null, sha256, last4). Transforms compile at startup (fail fast), are applied
+per sink outside the resilience wrapper, and never mutate the shared event —
+see `internal/infrastructure/transform` and config/sinks.example.yaml.
+
 ## Architecture
 
 Hexagonal architecture with Uber FX dependency injection:
@@ -101,6 +108,7 @@ internal/
       meilisearch/     # Meilisearch indexing sink
   infrastructure/
     config/            # Configuration loading from env vars and sink YAML
+    transform/         # Declarative per-sink transforms (CEL filters, masking)
     resilience/        # Circuit breaker and retry wrapper for sinks
     server/            # HTTP health/readiness/metrics server
     metrics/           # Prometheus metrics

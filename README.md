@@ -42,6 +42,10 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
 - **Per-table routing** — an optional YAML file selects which tables go to
   which sink and how keys are built, using Go templates
   (`{{.Prefix}}:orders:{{.Field "id"}}`).
+- **Declarative transforms** — PII masking (`sha256`, `last4`, `redact`,
+  `null`), column dropping, and CEL row filters, configured per sink and per
+  table in YAML. The stream can carry full rows while the search index gets
+  masked ones — no plugin code, no SMT classes.
 - **Resilience** — per-sink retries with exponential backoff and a circuit
   breaker that fails fast while a sink is down (the WAL position simply
   doesn't advance until it recovers).
@@ -190,6 +194,40 @@ meilisearch:
 
 Key patterns are Go templates with access to `{{.Prefix}}`, `{{.Schema}}`,
 `{{.Table}}`, `{{.Operation}}`, and `{{.Field "column"}}`.
+
+### Transforms: masking, filtering, dropping columns
+
+Every table entry can also be an object carrying transforms, and each sink
+section accepts a sink-wide `transform:` block (applied before the table's
+own). This is per sink by design — your event stream can keep full fidelity
+while your search index never sees an email address:
+
+```yaml
+redis_json:
+  transform:
+    drop_columns: [password_hash]        # applies to every table in this sink
+  tables:
+    public.users:
+      key: "{{.Prefix}}:users:{{.Field \"id\"}}"
+      mask:
+        email: sha256                    # deterministic hash (joinable)
+        phone: last4                     # ****1234
+      filter: 'new.deleted_at == null'   # CEL: deliver only when true
+```
+
+- **`filter`** is a [CEL](https://github.com/google/cel-go) expression with
+  variables `op`, `schema`, `table`, `new`, and `old`. Accessing a column
+  that's absent from the event is an error (visible, not silent data loss) —
+  guard optional columns with `"col" in new && new.col == ...`.
+- **`mask`** strategies: `redact` (`[REDACTED]`), `null`, `sha256`
+  (deterministic, so masked values still join/dedupe), `last4`
+  (`************4242`).
+- **`drop_columns`** removes columns entirely.
+
+Transforms are compiled at startup — a typo in a CEL expression or an unknown
+mask strategy fails boot with a clear error instead of surfacing mid-stream.
+Masking runs before key generation, so don't build sink keys from masked
+columns. Filtered events count in `cdc_events_filtered_total{sink,schema,table}`.
 
 > RedisJSON key patterns should only reference **replica identity** columns
 > (normally the primary key). Other columns are absent from DELETE events,
