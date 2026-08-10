@@ -2,9 +2,12 @@ package resilience
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/emoss08/gtc/internal/core/domain"
+	"github.com/emoss08/gtc/internal/infrastructure/metrics"
 	"github.com/sony/gobreaker/v2"
 )
 
@@ -26,6 +29,10 @@ func DefaultResilienceConfig() ResilienceConfig {
 	}
 }
 
+// ResilientSink wraps a Sink with retry and circuit-breaker behavior. When
+// the circuit is open, Process fails fast with domain.ErrCircuitOpen instead
+// of hammering an unhealthy sink; the failure still propagates so the WAL
+// position is not confirmed and the event is redelivered later.
 type ResilientSink struct {
 	inner   domain.Sink
 	breaker *gobreaker.CircuitBreaker[any]
@@ -39,12 +46,26 @@ func NewResilientSink(sink domain.Sink, cfg ResilienceConfig) *ResilientSink {
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
 			return counts.ConsecutiveFailures >= cfg.FailureThreshold
 		},
+		OnStateChange: func(name string, _, to gobreaker.State) {
+			metrics.CircuitBreakerState.WithLabelValues(name).Set(breakerStateValue(to))
+		},
 	}
 
 	return &ResilientSink{
 		inner:   sink,
 		breaker: gobreaker.NewCircuitBreaker[any](settings),
 		config:  cfg,
+	}
+}
+
+func breakerStateValue(s gobreaker.State) float64 {
+	switch s {
+	case gobreaker.StateClosed:
+		return 0
+	case gobreaker.StateHalfOpen:
+		return 1
+	default:
+		return 2
 	}
 }
 
@@ -60,6 +81,9 @@ func (s *ResilientSink) Process(ctx context.Context, event domain.CDCEvent) erro
 	_, err := s.breaker.Execute(func() (any, error) {
 		return nil, s.processWithRetry(ctx, event)
 	})
+	if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
+		return fmt.Errorf("%w: %s", domain.ErrCircuitOpen, err)
+	}
 	return err
 }
 
@@ -68,20 +92,24 @@ func (s *ResilientSink) processWithRetry(ctx context.Context, event domain.CDCEv
 	var lastErr error
 
 	for i := 0; i <= s.config.MaxRetries; i++ {
-		if err := s.inner.Process(ctx, event); err == nil {
+		lastErr = s.inner.Process(ctx, event)
+		if lastErr == nil {
 			return nil
-		} else {
-			lastErr = err
 		}
 
-		if i < s.config.MaxRetries {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-			backoff = min(backoff*2, s.config.MaxBackoff)
+		// Retrying after the context is done cannot succeed; surface the
+		// underlying failure immediately.
+		if ctx.Err() != nil || i == s.config.MaxRetries {
+			return lastErr
 		}
+
+		metrics.RetryAttempts.WithLabelValues(s.inner.Name()).Inc()
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, s.config.MaxBackoff)
 	}
 
 	return lastErr

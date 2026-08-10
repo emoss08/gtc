@@ -11,13 +11,16 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		DatabaseURL: getEnv(
 			"DATABASE_URL",
-			"postgres://postgres:postgres@localhost:5432/trenova_go_db?replication=database",
+			"postgres://postgres:postgres@localhost:5432/postgres?replication=database",
 		),
-		SlotName:          getEnv("CDC_SLOT_NAME", "cdc_demo_slot"),
-		PublicationName:   getEnv("CDC_PUBLICATION_NAME", "cdc_demo_publication"),
-		StandbyTimeout:    getDuration("CDC_STANDBY_TIMEOUT", 10*time.Second),
-		ParallelSinks:     getBool("CDC_PARALLEL_SINKS", false),
-		ProcessTimeout:    getDuration("CDC_PROCESS_TIMEOUT", 30*time.Second),
+		SlotName:        getEnv("CDC_SLOT_NAME", "cdc_demo_slot"),
+		PublicationName: getEnv("CDC_PUBLICATION_NAME", "cdc_demo_publication"),
+		StandbyTimeout:  getDuration("CDC_STANDBY_TIMEOUT", 10*time.Second),
+		ParallelSinks:   getBool("CDC_PARALLEL_SINKS", false),
+		// Kept well below Postgres's default wal_sender_timeout (60s):
+		// sinks run synchronously with the WAL stream, and a stalled sink
+		// must not starve standby keepalives long enough to be disconnected.
+		ProcessTimeout:    getDuration("CDC_PROCESS_TIMEOUT", 10*time.Second),
 		ExcludedTables:    parseTableSet("CDC_EXCLUDED_TABLES"),
 		HTTPPort:          getInt("HTTP_PORT", 8080),
 		AutoCreateSlot:    getBool("CDC_AUTO_CREATE_SLOT", true),
@@ -64,10 +67,14 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
+// The typed getters fall back to the default on unparsable input instead of
+// silently returning the type's zero value.
+
 func getBool(key string, defaultVal bool) bool {
 	if val := os.Getenv(key); val != "" {
-		b, _ := strconv.ParseBool(val)
-		return b
+		if b, err := strconv.ParseBool(val); err == nil {
+			return b
+		}
 	}
 	return defaultVal
 }
@@ -76,15 +83,6 @@ func getDuration(key string, defaultVal time.Duration) time.Duration {
 	if val := os.Getenv(key); val != "" {
 		if d, err := time.ParseDuration(val); err == nil {
 			return d
-		}
-	}
-	return defaultVal
-}
-
-func getInt64(key string, defaultVal int64) int64 {
-	if val := os.Getenv(key); val != "" {
-		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
-			return i
 		}
 	}
 	return defaultVal

@@ -42,7 +42,12 @@ type CDCEvent struct {
 	Table     string
 	OldData   map[string]any
 	NewData   map[string]any
-	Metadata  EventMetadata
+	// UnchangedToastColumns lists columns omitted from NewData because
+	// their TOASTed value was unchanged and not included in the WAL record.
+	// Sinks that replace whole documents must not treat the omission as a
+	// deletion of those fields.
+	UnchangedToastColumns []string
+	Metadata              EventMetadata
 }
 
 func (e *CDCEvent) FullTableName() string {

@@ -11,4 +11,5 @@ var (
 	ErrWALConnectionLost  = errors.New("WAL connection lost")
 	ErrInvalidEvent       = errors.New("invalid CDC event")
 	ErrCircuitOpen        = errors.New("circuit breaker is open")
+	ErrShuttingDown       = errors.New("service is shutting down")
 )

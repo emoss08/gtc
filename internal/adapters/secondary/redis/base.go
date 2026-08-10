@@ -92,9 +92,3 @@ func (s *BaseSink) GenerateKey(event domain.CDCEvent) (string, error) {
 	}
 	return key, nil
 }
-
-var _ domain.Sink = (*BaseSink)(nil)
-
-func (s *BaseSink) Process(ctx context.Context, event domain.CDCEvent) error {
-	panic("BaseSink.Process must be overridden")
-}

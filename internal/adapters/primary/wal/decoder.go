@@ -1,7 +1,8 @@
 package wal
 
 import (
-	"sync"
+	"fmt"
+	"time"
 
 	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/jackc/pglogrepl"
@@ -9,25 +10,19 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-var mapPool = sync.Pool{
-	New: func() any {
-		return make(map[string]any, 16)
-	},
-}
-
-func GetMap() map[string]any {
-	return mapPool.Get().(map[string]any)
-}
-
-func PutMap(m map[string]any) {
-	clear(m)
-	mapPool.Put(m)
-}
-
 type Decoder struct {
 	relations map[uint32]*pglogrepl.RelationMessageV2
 	typeMap   *pgtype.Map
-	inStream  bool
+	txn       txnState
+}
+
+// txnState carries Begin-message data so DML events can be stamped with the
+// transaction's commit time and XID, and so keepalives are only acknowledged
+// outside of an open transaction.
+type txnState struct {
+	inTxn      bool
+	xid        uint32
+	commitTime time.Time
 }
 
 func NewDecoder() *Decoder {
@@ -39,7 +34,17 @@ func NewDecoder() *Decoder {
 
 type DecodeResult struct {
 	Events []domain.CDCEvent
-	LSN    pglogrepl.LSN
+	// AckLSN, when non-zero, is a position that is safe to confirm to the
+	// server: either the end of a committed transaction whose events have
+	// all been emitted, or the server's WAL end from a keepalive received
+	// outside of any transaction.
+	AckLSN pglogrepl.LSN
+	// ServerWALEnd is the server's current WAL end position, used for lag
+	// reporting. It must never be confirmed as processed.
+	ServerWALEnd pglogrepl.LSN
+	// RequestReply is set when the server asked for an immediate standby
+	// status update.
+	RequestReply bool
 }
 
 func (d *Decoder) Decode(rawMsg pgproto3.BackendMessage) (*DecodeResult, error) {
@@ -54,133 +59,158 @@ func (d *Decoder) Decode(rawMsg pgproto3.BackendMessage) (*DecodeResult, error) 
 		if err != nil {
 			return nil, err
 		}
-		return &DecodeResult{LSN: pkm.ServerWALEnd}, nil
+		result := &DecodeResult{
+			ServerWALEnd: pkm.ServerWALEnd,
+			RequestReply: pkm.ReplyRequested,
+		}
+		// Only acknowledge the server's WAL end while no transaction is in
+		// flight; inside a transaction it would confirm events that have
+		// not been processed yet.
+		if !d.txn.inTxn {
+			result.AckLSN = pkm.ServerWALEnd
+		}
+		return result, nil
 
 	case pglogrepl.XLogDataByteID:
 		xld, err := pglogrepl.ParseXLogData(copyData.Data[1:])
 		if err != nil {
 			return nil, err
 		}
-		events, err := d.decodeWALData(xld.WALData, xld.WALStart)
+		result, err := d.decodeWALData(xld.WALData, xld.WALStart)
 		if err != nil {
 			return nil, err
 		}
-		return &DecodeResult{Events: events, LSN: xld.WALStart}, nil
+		result.ServerWALEnd = xld.ServerWALEnd
+		return result, nil
 	}
 
 	return &DecodeResult{}, nil
 }
 
-func (d *Decoder) decodeWALData(walData []byte, lsn pglogrepl.LSN) ([]domain.CDCEvent, error) {
-	logicalMsg, err := pglogrepl.ParseV2(walData, d.inStream)
+func (d *Decoder) decodeWALData(walData []byte, lsn pglogrepl.LSN) (*DecodeResult, error) {
+	logicalMsg, err := pglogrepl.ParseV2(walData, false)
 	if err != nil {
 		return nil, err
 	}
 
-	var events []domain.CDCEvent
+	result := &DecodeResult{}
 
 	switch msg := logicalMsg.(type) {
+	case *pglogrepl.BeginMessage:
+		d.txn.inTxn = true
+		d.txn.xid = msg.Xid
+		d.txn.commitTime = msg.CommitTime
+
+	case *pglogrepl.CommitMessage:
+		d.txn.inTxn = false
+		// The whole transaction has been decoded and every event handed to
+		// the handler synchronously, so its end position is safe to confirm.
+		result.AckLSN = msg.TransactionEndLSN
+
 	case *pglogrepl.RelationMessageV2:
 		d.relations[msg.RelationID] = msg
 
 	case *pglogrepl.InsertMessageV2:
-		rel := d.relations[msg.RelationID]
-		if rel == nil {
-			return nil, nil
+		rel, err := d.relation(msg.RelationID)
+		if err != nil {
+			return nil, err
 		}
-		events = append(events, domain.CDCEvent{
-			ID:        lsn.String(),
-			Operation: domain.OperationInsert,
-			Schema:    rel.Namespace,
-			Table:     rel.RelationName,
-			NewData:   d.decodeTuple(msg.Tuple, rel),
-			Metadata: domain.EventMetadata{
-				LSN:           lsn.String(),
-				TransactionID: msg.Xid,
-			},
-		})
+		newData, _ := d.decodeTuple(msg.Tuple, rel)
+		result.Events = append(result.Events, d.newEvent(lsn, domain.OperationInsert, rel, nil, newData, nil))
 
 	case *pglogrepl.UpdateMessageV2:
-		rel := d.relations[msg.RelationID]
-		if rel == nil {
-			return nil, nil
+		rel, err := d.relation(msg.RelationID)
+		if err != nil {
+			return nil, err
 		}
-		event := domain.CDCEvent{
-			ID:        lsn.String(),
-			Operation: domain.OperationUpdate,
-			Schema:    rel.Namespace,
-			Table:     rel.RelationName,
-			NewData:   d.decodeTuple(msg.NewTuple, rel),
-			Metadata: domain.EventMetadata{
-				LSN:           lsn.String(),
-				TransactionID: msg.Xid,
-			},
-		}
+		newData, unchangedToast := d.decodeTuple(msg.NewTuple, rel)
+		var oldData map[string]any
 		if msg.OldTuple != nil {
-			event.OldData = d.decodeTuple(msg.OldTuple, rel)
+			oldData, _ = d.decodeTuple(msg.OldTuple, rel)
 		}
-		events = append(events, event)
+		result.Events = append(result.Events, d.newEvent(lsn, domain.OperationUpdate, rel, oldData, newData, unchangedToast))
 
 	case *pglogrepl.DeleteMessageV2:
-		rel := d.relations[msg.RelationID]
-		if rel == nil {
-			return nil, nil
+		rel, err := d.relation(msg.RelationID)
+		if err != nil {
+			return nil, err
 		}
-		events = append(events, domain.CDCEvent{
-			ID:        lsn.String(),
-			Operation: domain.OperationDelete,
-			Schema:    rel.Namespace,
-			Table:     rel.RelationName,
-			OldData:   d.decodeTuple(msg.OldTuple, rel),
-			Metadata: domain.EventMetadata{
-				LSN:           lsn.String(),
-				TransactionID: msg.Xid,
-			},
-		})
+		oldData, _ := d.decodeTuple(msg.OldTuple, rel)
+		result.Events = append(result.Events, d.newEvent(lsn, domain.OperationDelete, rel, oldData, nil, nil))
 
 	case *pglogrepl.TruncateMessageV2:
-		for _, relID := range msg.RelationIDs {
-			if rel, ok := d.relations[relID]; ok {
-				events = append(events, domain.CDCEvent{
-					ID:        lsn.String(),
-					Operation: domain.OperationTruncate,
-					Schema:    rel.Namespace,
-					Table:     rel.RelationName,
-					Metadata: domain.EventMetadata{
-						LSN:           lsn.String(),
-						TransactionID: msg.Xid,
-					},
-				})
+		for i, relID := range msg.RelationIDs {
+			rel, err := d.relation(relID)
+			if err != nil {
+				return nil, err
 			}
+			event := d.newEvent(lsn, domain.OperationTruncate, rel, nil, nil, nil)
+			event.ID = fmt.Sprintf("%s-%d", lsn, i)
+			result.Events = append(result.Events, event)
 		}
 
-	case *pglogrepl.StreamStartMessageV2:
-		d.inStream = true
-
-	case *pglogrepl.StreamStopMessageV2:
-		d.inStream = false
+	case *pglogrepl.StreamStartMessageV2, *pglogrepl.StreamStopMessageV2,
+		*pglogrepl.StreamCommitMessageV2, *pglogrepl.StreamAbortMessageV2:
+		// Streaming of in-progress transactions is not requested; receiving
+		// one of these means the plugin arguments and reality disagree.
+		return nil, fmt.Errorf("unexpected streamed-transaction message %T (streaming is disabled)", msg)
 	}
 
-	return events, nil
+	return result, nil
 }
 
+func (d *Decoder) relation(relationID uint32) (*pglogrepl.RelationMessageV2, error) {
+	rel, ok := d.relations[relationID]
+	if !ok {
+		return nil, fmt.Errorf("no relation message received for relation ID %d", relationID)
+	}
+	return rel, nil
+}
+
+func (d *Decoder) newEvent(
+	lsn pglogrepl.LSN,
+	op domain.Operation,
+	rel *pglogrepl.RelationMessageV2,
+	oldData, newData map[string]any,
+	unchangedToast []string,
+) domain.CDCEvent {
+	return domain.CDCEvent{
+		ID:                    lsn.String(),
+		Operation:             op,
+		Schema:                rel.Namespace,
+		Table:                 rel.RelationName,
+		OldData:               oldData,
+		NewData:               newData,
+		UnchangedToastColumns: unchangedToast,
+		Metadata: domain.EventMetadata{
+			LSN:           lsn.String(),
+			TransactionID: d.txn.xid,
+			Timestamp:     d.txn.commitTime,
+		},
+	}
+}
+
+// decodeTuple converts a tuple into a column map. Columns whose value is an
+// unchanged TOAST datum (not included in the WAL record) are omitted from the
+// map and reported separately so sinks can avoid overwriting real values.
 func (d *Decoder) decodeTuple(
 	tuple *pglogrepl.TupleData,
 	rel *pglogrepl.RelationMessageV2,
-) map[string]any {
+) (map[string]any, []string) {
 	if tuple == nil {
-		return nil
+		return nil, nil
 	}
 
-	values := make(map[string]any)
+	values := make(map[string]any, len(tuple.Columns))
+	var unchangedToast []string
 	for idx, col := range tuple.Columns {
 		colName := rel.Columns[idx].Name
 		switch col.DataType {
-		case 'n':
+		case pglogrepl.TupleDataTypeNull:
 			values[colName] = nil
-		case 'u':
-			values[colName] = "(unchanged-toast)"
-		case 't':
+		case pglogrepl.TupleDataTypeToast:
+			unchangedToast = append(unchangedToast, colName)
+		case pglogrepl.TupleDataTypeText:
 			val, err := d.decodeTextColumn(col.Data, rel.Columns[idx].DataType)
 			if err != nil {
 				values[colName] = string(col.Data)
@@ -190,10 +220,18 @@ func (d *Decoder) decodeTuple(
 		}
 	}
 
-	return values
+	return values, unchangedToast
 }
 
 func (d *Decoder) decodeTextColumn(data []byte, dataType uint32) (any, error) {
+	// pgtype decodes some types into Go values that do not serialize to
+	// JSON the way consumers expect (UUID becomes [16]byte, numeric becomes
+	// a struct). Postgres's text representation is already exact and
+	// readable for these, so pass it through untouched.
+	switch dataType {
+	case pgtype.UUIDOID, pgtype.NumericOID:
+		return string(data), nil
+	}
 	if dt, ok := d.typeMap.TypeForOID(dataType); ok {
 		return dt.Codec.DecodeValue(d.typeMap, dataType, pgtype.TextFormatCode, data)
 	}

@@ -93,13 +93,23 @@ func (s *JSONSink) setJSON(ctx context.Context, key string, event domain.CDCEven
 		return fmt.Errorf("marshal data: %w", err)
 	}
 
-	if err := s.Client.Do(ctx, "JSON.SET", key, "$", string(jsonData)).Err(); err != nil {
-		s.Logger.Error("failed to set json",
+	// When an UPDATE omits unchanged TOAST columns, a full JSON.SET would
+	// erase their previously stored values, so merge into the existing
+	// document instead. Note JSON.MERGE (RFC 7386) deletes fields whose
+	// incoming value is null, which matches a column being set to NULL.
+	command := "JSON.SET"
+	if event.Operation == domain.OperationUpdate && len(event.UnchangedToastColumns) > 0 {
+		command = "JSON.MERGE"
+	}
+
+	if err := s.Client.Do(ctx, command, key, "$", string(jsonData)).Err(); err != nil {
+		s.Logger.Error("failed to write json",
 			slog.String("error", err.Error()),
+			slog.String("command", command),
 			slog.String("key", key),
 			slog.String("event_id", event.ID),
 		)
-		return fmt.Errorf("json.set: %w", err)
+		return fmt.Errorf("%s: %w", command, err)
 	}
 
 	s.Logger.Debug("json set",
