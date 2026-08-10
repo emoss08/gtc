@@ -27,6 +27,12 @@ func Load() (*Config, error) {
 		AutoCreatePub:     getBool("CDC_AUTO_CREATE_PUBLICATION", true),
 		SlotRetryInterval: getDuration("CDC_SLOT_RETRY_INTERVAL", 5*time.Second),
 		SlotRetryTimeout:  getDuration("CDC_SLOT_RETRY_TIMEOUT", 60*time.Second),
+		Backfill: BackfillConfig{
+			Mode:       getEnv("CDC_BACKFILL_MODE", "auto"),
+			ChunkSize:  getInt("CDC_BACKFILL_CHUNK_SIZE", 1000),
+			ChunkDelay: getDuration("CDC_BACKFILL_CHUNK_DELAY", 0),
+			StateTable: backfillStateTable(),
+		},
 		Resilience: ResilienceConfig{
 			CircuitBreakerThreshold: getUint32("CDC_CIRCUIT_BREAKER_THRESHOLD", 5),
 			CircuitBreakerTimeout:   getDuration("CDC_CIRCUIT_BREAKER_TIMEOUT", 30*time.Second),
@@ -41,6 +47,16 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// backfillStateTable returns the backfill progress table name; the sentinel
+// "none" disables persistence (env vars can't distinguish empty from unset).
+func backfillStateTable() string {
+	name := getEnv("CDC_BACKFILL_STATE_TABLE", "gtc_backfill_state")
+	if name == "none" {
+		return ""
+	}
+	return name
 }
 
 func parseTableSet(key string) map[string]struct{} {

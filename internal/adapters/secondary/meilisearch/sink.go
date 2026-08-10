@@ -67,7 +67,7 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 	index := s.client.Index(indexName)
 
 	switch event.Operation {
-	case domain.OperationInsert, domain.OperationUpdate:
+	case domain.OperationInsert, domain.OperationUpdate, domain.OperationRead:
 		if event.NewData == nil {
 			s.logger.Debug("skipping event, no new data",
 				slog.String("event_id", event.ID),
@@ -78,13 +78,13 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 		docs := []map[string]any{event.NewData}
 		var task *meilisearch.TaskInfo
 		var err error
-		if event.Operation == domain.OperationInsert {
-			task, err = index.AddDocumentsWithContext(ctx, docs, nil)
-		} else {
+		if event.Operation == domain.OperationUpdate {
 			// Partial update: fields omitted from NewData (e.g. unchanged
 			// TOAST columns) keep their previously indexed values instead
 			// of being wiped by a full document replacement.
 			task, err = index.UpdateDocumentsWithContext(ctx, docs, nil)
+		} else {
+			task, err = index.AddDocumentsWithContext(ctx, docs, nil)
 		}
 		if err != nil {
 			s.logger.Error("failed to write document",

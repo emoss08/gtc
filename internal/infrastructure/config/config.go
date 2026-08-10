@@ -21,6 +21,20 @@ type Config struct {
 	AutoCreatePub     bool
 	SlotRetryInterval time.Duration
 	SlotRetryTimeout  time.Duration
+	Backfill          BackfillConfig
+}
+
+type BackfillConfig struct {
+	// Mode: "auto" backfills all published tables when the replication
+	// slot is first created (and resumes interrupted backfills on start);
+	// "manual" only backfills via the HTTP API; "off" disables backfill.
+	Mode       string
+	ChunkSize  int
+	ChunkDelay time.Duration
+	// StateTable is the table used to persist per-table progress in the
+	// source database. Empty disables persistence (backfills restart from
+	// scratch after a crash).
+	StateTable string
 }
 
 type ResilienceConfig struct {
@@ -46,6 +60,14 @@ func (c Config) Validate() error {
 			validation.Max(65535),
 		),
 		validation.Field(&c.Resilience),
+		validation.Field(&c.Backfill),
+	)
+}
+
+func (c BackfillConfig) Validate() error {
+	return validation.ValidateStruct(&c,
+		validation.Field(&c.Mode, validation.Required, validation.In("auto", "manual", "off")),
+		validation.Field(&c.ChunkSize, validation.Min(1)),
 	)
 }
 

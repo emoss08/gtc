@@ -35,6 +35,11 @@ Consequences to keep in mind:
   placeholder strings) and listed in `UnchangedToastColumns`. Sinks handle
   this with partial updates (Meilisearch `UpdateDocuments`, RedisJSON
   `JSON.MERGE`).
+- Backfill emits `READ` events for existing rows, interleaved with the live
+  stream via WAL watermarks (`pg_logical_emit_message`, prefix
+  `gtc-backfill`). Chunk rows superseded by live events between the low and
+  high watermarks are dropped, preserving per-key ordering. Sinks must treat
+  `OperationRead` like an insert of the row's current state.
 
 ## Environment Variables
 
@@ -58,6 +63,10 @@ Consequences to keep in mind:
 | CDC_RETRY_BACKOFF_MAX | 10s | Maximum retry backoff |
 | CDC_CIRCUIT_BREAKER_THRESHOLD | 5 | Consecutive failures before the circuit opens |
 | CDC_CIRCUIT_BREAKER_TIMEOUT | 30s | How long an open circuit stays open |
+| CDC_BACKFILL_MODE | auto | auto = backfill all tables when the slot is first created; manual = API only; off |
+| CDC_BACKFILL_CHUNK_SIZE | 1000 | Rows per backfill chunk |
+| CDC_BACKFILL_CHUNK_DELAY | 0 | Pause between chunks |
+| CDC_BACKFILL_STATE_TABLE | gtc_backfill_state | Progress table in the source DB ("none" disables resume) |
 | SINK_CONFIG_FILE | - | Path to per-table sink YAML (see config/sinks.example.yaml). Without it, Redis sinks mirror all tables |
 | REDIS_URL | - | Redis connection (enables stream sink if set) |
 | REDIS_STREAM_PREFIX | cdc | Stream key prefix |
@@ -85,6 +94,7 @@ internal/
     services/          # CDCService and SinkRegistry implementations
   adapters/
     primary/wal/       # PostgreSQL WAL reader and pgoutput decoder
+    primary/backfill/  # Watermark-based chunked backfill (DBLog algorithm)
     secondary/
       redis/           # Redis stream sink + shared base/key templates
       redisjson/       # RedisJSON document sink

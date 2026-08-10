@@ -16,6 +16,10 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
+// WatermarkPrefix is the pg_logical_emit_message prefix used for backfill
+// watermarks.
+const WatermarkPrefix = "gtc-backfill"
+
 type Config struct {
 	DatabaseURL         string
 	SlotName            string
@@ -27,18 +31,26 @@ type Config struct {
 	AutoCreatePub       bool
 	SlotRetryInterval   time.Duration
 	SlotRetryTimeout    time.Duration
+	// Controller, when set, interleaves backfill chunks with the live
+	// stream (see ports.BackfillController).
+	Controller ports.BackfillController
+	// StreamStarted, when set, is called after replication is (re)established.
+	// slotCreated reports whether this run created the replication slot —
+	// true only on the very first start against a fresh database.
+	StreamStarted func(slotCreated bool)
 }
 
 type Reader struct {
-	config    Config
-	logger    *slog.Logger
-	conn      *pgconn.PgConn
-	decoder   *Decoder
-	clientLSN atomic.Uint64
-	streaming atomic.Bool
-	shutdown  chan struct{}
-	done      chan struct{}
-	stopOnce  sync.Once
+	config      Config
+	logger      *slog.Logger
+	conn        *pgconn.PgConn
+	decoder     *Decoder
+	clientLSN   atomic.Uint64
+	streaming   atomic.Bool
+	slotCreated bool
+	shutdown    chan struct{}
+	done        chan struct{}
+	stopOnce    sync.Once
 }
 
 func NewReader(cfg Config, logger *slog.Logger) *Reader {
@@ -99,8 +111,15 @@ func (r *Reader) Start(ctx context.Context, handler ports.WALEventHandler) error
 			backoff = time.Second
 		}
 
+		if r.config.StreamStarted != nil {
+			r.config.StreamStarted(r.slotCreated)
+		}
+
 		r.logger.Info("WAL streaming started, listening for changes")
 		if err := r.streamLoop(ctx, handler); err != nil {
+			if r.config.Controller != nil {
+				r.config.Controller.OnStreamRestart()
+			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -256,6 +275,7 @@ func (r *Reader) ensureReplicationSlot(ctx context.Context) (pglogrepl.LSN, erro
 	if err != nil {
 		return 0, fmt.Errorf("create replication slot failed: %w", err)
 	}
+	r.slotCreated = true
 
 	startLSN, err := pglogrepl.ParseLSN(slotResult.ConsistentPoint)
 	if err != nil {
@@ -273,10 +293,11 @@ func (r *Reader) startReplicationWithRetry(ctx context.Context, startLSN pglogre
 	// Streaming of in-progress transactions is deliberately not requested:
 	// streamed changes can belong to transactions that later abort, and
 	// delivering them to sinks before commit would publish phantom data.
+	// Logical decoding messages are enabled for backfill watermarks.
 	pluginArguments := []string{
 		"proto_version '2'",
 		fmt.Sprintf("publication_names '%s'", r.config.PublicationName),
-		"messages 'false'",
+		"messages 'true'",
 	}
 
 	deadline := time.Now().Add(r.config.SlotRetryTimeout)
@@ -378,6 +399,10 @@ func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) 
 				slog.Int("xid", int(event.Metadata.TransactionID)),
 			)
 
+			if r.config.Controller != nil {
+				r.config.Controller.ObserveEvent(event)
+			}
+
 			// A handler error means at least one sink did not durably
 			// process the event. Returning the error tears down the
 			// connection without confirming the transaction's LSN, so the
@@ -390,6 +415,24 @@ func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) 
 				return fmt.Errorf("handler failed: %w", err)
 			}
 			eventsProcessed++
+		}
+
+		if msg := result.Message; msg != nil && msg.Prefix == WatermarkPrefix && r.config.Controller != nil {
+			// Backfill chunk rows are emitted at the high-watermark
+			// position; a handler error tears the stream down and the
+			// coordinator retries the chunk with fresh watermarks.
+			events := r.config.Controller.HandleWatermark(msg.LSN.String(), msg.Content)
+			for _, event := range events {
+				if err := handler(ctx, event); err != nil {
+					r.logger.Error("backfill handler failed",
+						slog.String("error", err.Error()),
+						slog.String("event_id", event.ID),
+					)
+					return fmt.Errorf("backfill handler failed: %w", err)
+				}
+				eventsProcessed++
+			}
+			r.config.Controller.WatermarkDelivered(msg.Content)
 		}
 
 		if uint64(result.AckLSN) > r.clientLSN.Load() {
