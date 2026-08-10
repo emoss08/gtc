@@ -26,7 +26,14 @@ idempotent; stream consumers should dedupe by `event_id`).
 Consequences to keep in mind:
 
 - A sink that is down does not lose events; it stalls the pipeline (replication
-  slot WAL retention grows) until the sink recovers.
+  slot WAL retention grows) until the sink recovers. A *poison event* (same
+  event failing the same sink CDC_DLQ_THRESHOLD times) is parked in the Redis
+  dead-letter queue instead, and triaged via GET /dlq, POST /dlq/retry,
+  POST /dlq/discard. Circuit-open failures never park (a down sink is not a
+  poison event), and a full/unreachable DLQ stalls rather than drops. Sink
+  layering is transform(dlq(resilience(sink))): parked entries hold the
+  already-transformed event, and retries bypass transforms so masking is
+  never re-applied.
 - `CDC_PROCESS_TIMEOUT` (default 10s) must stay small enough that
   sink-count × timeout is below PostgreSQL's `wal_sender_timeout` (default
   60s), because sinks run synchronously with the WAL stream and standby
@@ -67,6 +74,9 @@ Consequences to keep in mind:
 | CDC_BACKFILL_CHUNK_SIZE | 1000 | Rows per backfill chunk |
 | CDC_BACKFILL_CHUNK_DELAY | 0 | Pause between chunks |
 | CDC_BACKFILL_STATE_TABLE | gtc_backfill_state | Progress table in the source DB ("none" disables resume) |
+| CDC_DLQ_ENABLED | true | Park poison events in Redis instead of stalling forever (needs REDIS_URL) |
+| CDC_DLQ_THRESHOLD | 3 | Failure cycles for the same event before it is parked |
+| CDC_DLQ_MAX_ENTRIES | 10000 | DLQ cap; when full, parking fails and the pipeline stalls |
 | SINK_CONFIG_FILE | - | Path to per-table sink YAML (see config/sinks.example.yaml). Without it, Redis sinks mirror all tables |
 | REDIS_URL | - | Redis connection (enables stream sink if set) |
 | REDIS_STREAM_PREFIX | cdc | Stream key prefix |
@@ -117,6 +127,7 @@ internal/
     config/            # Configuration loading from env vars and sink YAML
     transform/         # Declarative per-sink transforms (CEL filters, masking)
     resilience/        # Circuit breaker and retry wrapper for sinks
+    dlq/               # Dead-letter queue (Redis store, parking decorator, triage)
     server/            # HTTP health/readiness/metrics server
     metrics/           # Prometheus metrics
 ```

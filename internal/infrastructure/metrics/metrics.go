@@ -119,4 +119,30 @@ var (
 		},
 		[]string{"schema", "table"},
 	)
+
+	DLQEntries = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "cdc",
+			Name:      "dlq_entries",
+			Help:      "Current number of parked dead-letter entries",
+		},
+	)
+
+	DLQParkedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "cdc",
+			Name:      "dlq_parked_total",
+			Help:      "Total events parked in the dead-letter queue",
+		},
+		[]string{"sink"},
+	)
+
+	DLQRetriedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "cdc",
+			Name:      "dlq_retried_total",
+			Help:      "Total dead-letter retry attempts by outcome",
+		},
+		[]string{"sink", "status"},
+	)
 )

@@ -33,6 +33,11 @@ func Load() (*Config, error) {
 			ChunkDelay: getDuration("CDC_BACKFILL_CHUNK_DELAY", 0),
 			StateTable: backfillStateTable(),
 		},
+		DLQ: DLQConfig{
+			Enabled:    getBool("CDC_DLQ_ENABLED", true),
+			Threshold:  getInt("CDC_DLQ_THRESHOLD", 3),
+			MaxEntries: int64(getInt("CDC_DLQ_MAX_ENTRIES", 10000)),
+		},
 		Resilience: ResilienceConfig{
 			CircuitBreakerThreshold: getUint32("CDC_CIRCUIT_BREAKER_THRESHOLD", 5),
 			CircuitBreakerTimeout:   getDuration("CDC_CIRCUIT_BREAKER_TIMEOUT", 30*time.Second),

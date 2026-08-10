@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ type Server struct {
 	logger     *slog.Logger
 	checker    HealthChecker
 	backfill   ports.BackfillManager
+	dlq        ports.DLQManager
 }
 
 type HealthChecker interface {
@@ -36,6 +38,7 @@ type ServerParams struct {
 	Config   Config
 	Checker  HealthChecker
 	Backfill ports.BackfillManager // nil when backfill is disabled
+	DLQ      ports.DLQManager      // nil when the DLQ is disabled
 	Logger   *slog.Logger
 }
 
@@ -52,6 +55,7 @@ func New(p ServerParams) *Server {
 		logger:   p.Logger.With(slog.String("component", "http_server")),
 		checker:  p.Checker,
 		backfill: p.Backfill,
+		dlq:      p.DLQ,
 		httpServer: &http.Server{
 			Addr:         fmt.Sprintf(":%d", p.Config.Port),
 			Handler:      r,
@@ -71,6 +75,102 @@ func (s *Server) registerRoutes() {
 	s.router.Handle("/metrics", promhttp.Handler())
 	s.router.Get("/backfill", s.handleBackfillStatus)
 	s.router.Post("/backfill", s.handleBackfillTrigger)
+	s.router.Get("/dlq", s.handleDLQList)
+	s.router.Post("/dlq/retry", s.handleDLQRetry)
+	s.router.Post("/dlq/discard", s.handleDLQDiscard)
+}
+
+// Entry IDs contain characters that are awkward in URL paths (the LSN in
+// "meilisearch:0/1A2B3C4"), so retry/discard take the ID in a JSON body.
+
+func (s *Server) handleDLQList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.dlq == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte(`{"error":"dead-letter queue is disabled"}`))
+		return
+	}
+
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+
+	entries, err := s.dlq.List(r.Context(), limit)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	total, _ := s.dlq.Len(r.Context())
+	_ = json.NewEncoder(w).Encode(map[string]any{"total": total, "entries": entries})
+}
+
+func (s *Server) handleDLQRetry(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.dlq == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte(`{"error":"dead-letter queue is disabled"}`))
+		return
+	}
+
+	var req struct {
+		ID  string `json:"id"`
+		All bool   `json:"all"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid JSON body"}`))
+		return
+	}
+
+	switch {
+	case req.All:
+		result, err := s.dlq.RetryAll(r.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error(), "result": result})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(result)
+	case req.ID != "":
+		if err := s.dlq.Retry(r.Context(), req.ID); err != nil {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"retried"}`))
+	default:
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"provide {\"id\":\"...\"} or {\"all\":true}"}`))
+	}
+}
+
+func (s *Server) handleDLQDiscard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.dlq == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte(`{"error":"dead-letter queue is disabled"}`))
+		return
+	}
+
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"provide {\"id\":\"...\"}"}`))
+		return
+	}
+
+	if err := s.dlq.Discard(r.Context(), req.ID); err != nil {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	_, _ = w.Write([]byte(`{"status":"discarded"}`))
 }
 
 func (s *Server) handleBackfillStatus(w http.ResponseWriter, r *http.Request) {

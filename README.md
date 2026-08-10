@@ -53,6 +53,11 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
 - **Resilience** — per-sink retries with exponential backoff and a circuit
   breaker that fails fast while a sink is down (the WAL position simply
   doesn't advance until it recovers).
+- **Dead-letter queue with a triage API** — a poison event that repeatedly
+  fails one sink is parked in Redis instead of stalling the pipeline
+  forever, then inspected, retried, or discarded over HTTP. Sink *outages*
+  still stall (a down sink is not a poison event) — nothing is ever
+  silently dropped.
 - **Observability** — Prometheus metrics (events, per-sink latency, errors,
   retries, breaker state, WAL lag in bytes), health and readiness endpoints,
   structured JSON logs.
@@ -164,6 +169,9 @@ lives in an optional YAML file.
 | `CDC_BACKFILL_CHUNK_SIZE` | `1000` | Rows per backfill chunk |
 | `CDC_BACKFILL_CHUNK_DELAY` | `0` | Pause between chunks (throttle source load) |
 | `CDC_BACKFILL_STATE_TABLE` | `gtc_backfill_state` | Progress table in the source DB (`none` disables resume) |
+| `CDC_DLQ_ENABLED` | `true` | Park poison events in Redis instead of stalling forever (needs `REDIS_URL`) |
+| `CDC_DLQ_THRESHOLD` | `3` | Failure cycles for the same event before it is parked |
+| `CDC_DLQ_MAX_ENTRIES` | `10000` | DLQ cap; when full, parking fails and the pipeline stalls |
 | `SINK_CONFIG_FILE` | – | Path to the per-table sink YAML (below) |
 | `REDIS_URL` | – | Enables the Redis Stream sink |
 | `REDIS_STREAM_PREFIX` | `cdc` | Stream key prefix |
@@ -335,6 +343,38 @@ Consequences worth knowing:
   a streamed transaction can still abort, and GTC refuses to publish data
   that was never committed.
 
+### Dead-letter queue
+
+A *poison event* — one that a sink permanently rejects (bad document schema,
+oversized value) — would otherwise stall the pipeline forever. With Redis
+configured, GTC parks it instead: after the same event fails the same sink
+through `CDC_DLQ_THRESHOLD` (default 3) full retry-and-replay cycles, the
+complete event is stored in Redis and the pipeline moves on.
+
+The distinction that matters: **outages never divert to the DLQ.** A failure
+caused by an open circuit breaker means the sink is down, so it stalls the
+pipeline (as it should) instead of shoveling the whole stream into the queue.
+And when the DLQ is full (`CDC_DLQ_MAX_ENTRIES`, default 10000) or Redis is
+unreachable, parking fails and the pipeline stalls — the DLQ never drops an
+event to save itself.
+
+Triage over HTTP:
+
+```bash
+curl localhost:8080/dlq                                   # inspect (?limit=)
+curl -X POST localhost:8080/dlq/retry   -d '{"id":"meilisearch:0/1A2B3C4"}'
+curl -X POST localhost:8080/dlq/retry   -d '{"all":true}'
+curl -X POST localhost:8080/dlq/discard -d '{"id":"meilisearch:0/1A2B3C4"}'
+```
+
+Retries re-deliver the stored (already-transformed) event straight to the
+sink it failed. **Ordering caveat:** if newer changes for the same row have
+flowed since the event was parked, retrying it re-applies the older state —
+for a long-parked entry, prefer discarding it and re-syncing the table via
+`POST /backfill`. Monitor `cdc_dlq_entries` and alert when it grows.
+
+Set `CDC_DLQ_ENABLED=false` to opt out and always stall on failure.
+
 ## Observability
 
 | Endpoint | Purpose |
@@ -344,6 +384,9 @@ Consequences worth knowing:
 | `GET /metrics` | Prometheus metrics |
 | `GET /backfill` | Backfill progress per table |
 | `POST /backfill` | Trigger a backfill/replay (`{"table":"schema.table"}` or `{"all":true}`) |
+| `GET /dlq` | List parked dead-letter entries (`?limit=`) |
+| `POST /dlq/retry` | Retry an entry (`{"id":"..."}`) or all (`{"all":true}`) |
+| `POST /dlq/discard` | Discard an entry (`{"id":"..."}`) |
 
 Key metrics (all prefixed `cdc_`): `events_received_total`,
 `events_processed_total{sink,status}`, `event_processing_duration_seconds`,
@@ -374,6 +417,7 @@ internal/
   infrastructure/
     config/            # Env + sink YAML loading
     resilience/        # Retry + circuit breaker wrapper for sinks
+    dlq/               # Dead-letter queue: parking decorator + triage API backend
     server/            # HTTP health/readiness/metrics
     metrics/           # Prometheus collectors
 ```
