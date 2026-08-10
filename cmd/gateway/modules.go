@@ -10,6 +10,7 @@ import (
 	"github.com/emoss08/gtc/internal/adapters/primary/backfill"
 	"github.com/emoss08/gtc/internal/adapters/primary/wal"
 	meilisink "github.com/emoss08/gtc/internal/adapters/secondary/meilisearch"
+	outboxsink "github.com/emoss08/gtc/internal/adapters/secondary/outbox"
 	redissink "github.com/emoss08/gtc/internal/adapters/secondary/redis"
 	redisjsonsink "github.com/emoss08/gtc/internal/adapters/secondary/redisjson"
 	"github.com/emoss08/gtc/internal/core/domain"
@@ -43,7 +44,11 @@ func Module() fx.Option {
 }
 
 // newBackfillCoordinator returns nil when backfill is disabled.
-func newBackfillCoordinator(cfg *config.Config, logger *slog.Logger) (*backfill.Coordinator, error) {
+func newBackfillCoordinator(
+	cfg *config.Config,
+	sinksCfg *config.SinksConfig,
+	logger *slog.Logger,
+) (*backfill.Coordinator, error) {
 	if cfg.Backfill.Mode == "off" {
 		return nil, nil
 	}
@@ -56,12 +61,22 @@ func newBackfillCoordinator(cfg *config.Config, logger *slog.Logger) (*backfill.
 		return nil, err
 	}
 
+	excluded := make(map[string]struct{}, len(cfg.ExcludedTables)+1)
+	for t := range cfg.ExcludedTables {
+		excluded[t] = struct{}{}
+	}
+	// Backfilling the outbox would republish historical messages.
+	if sinksCfg.Outbox.Enabled() {
+		schema, table := sinksCfg.Outbox.SchemaTable()
+		excluded[schema+"."+table] = struct{}{}
+	}
+
 	return backfill.NewCoordinator(db, backfill.Config{
 		SlotName:        cfg.SlotName,
 		PublicationName: cfg.PublicationName,
 		ChunkSize:       cfg.Backfill.ChunkSize,
 		ChunkDelay:      cfg.Backfill.ChunkDelay,
-		ExcludedTables:  cfg.ExcludedTables,
+		ExcludedTables:  excluded,
 	}, logger), nil
 }
 
@@ -124,9 +139,17 @@ func newSinks(
 
 	var sinks []domain.Sink
 
+	outboxCfg := sinksCfg.Outbox
+	outboxSchema, outboxTable := "", ""
+	if outboxCfg.Enabled() {
+		outboxSchema, outboxTable = outboxCfg.SchemaTable()
+	}
+
 	// Each sink is wrapped resilience-first, then transforms, so retries
 	// operate on the already-transformed event and a filter/mask error is
-	// not treated as a sink failure by the circuit breaker.
+	// not treated as a sink failure by the circuit breaker. When an outbox
+	// is configured, its table is kept out of the data-mirroring sinks —
+	// outbox rows are messages, not data.
 	addSink := func(
 		sink domain.Sink,
 		global *config.TransformSpec,
@@ -136,6 +159,9 @@ func newSinks(
 			resilience.NewResilientSink(sink, resCfg), global, tables, logger)
 		if err != nil {
 			return err
+		}
+		if outboxCfg.Enabled() {
+			wrapped = outboxsink.ExcludeTable(wrapped, outboxSchema, outboxTable)
 		}
 		sinks = append(sinks, wrapped)
 		return nil
@@ -199,6 +225,27 @@ func newSinks(
 		if err := addSink(sink, sinksCfg.Meilisearch.Transform, sinksCfg.Meilisearch.TableTransforms()); err != nil {
 			return nil, err
 		}
+	}
+
+	if outboxCfg.Enabled() {
+		rc := redissink.LoadConfig()
+		sink, err := outboxsink.NewSink(outboxsink.Config{
+			Schema:             outboxSchema,
+			Table:              outboxTable,
+			StreamPrefix:       outboxCfg.StreamPrefix,
+			DefaultTopic:       outboxCfg.DefaultTopic,
+			DeleteAfterPublish: outboxCfg.DeleteAfterPublish,
+			Columns:            outboxCfg.Columns,
+			RedisURL:           rc.URL,
+			MaxStreamLen:       rc.MaxStreamLen,
+			DatabaseURL:        backfill.NonReplicationURL(cfg.DatabaseURL),
+		}, logger)
+		if err != nil {
+			return nil, err
+		}
+		// No transform wrapper: outbox rows are messages, and filtering or
+		// masking them belongs to whoever writes the outbox.
+		sinks = append(sinks, resilience.NewResilientSink(sink, resCfg))
 	}
 
 	return sinks, nil

@@ -88,6 +88,12 @@ null, sha256, last4). Transforms compile at startup (fail fast), are applied
 per sink outside the resilience wrapper, and never mutate the shared event —
 see `internal/infrastructure/transform` and config/sinks.example.yaml.
 
+An `outbox:` section in the sink YAML enables the transactional outbox sink:
+INSERTs into the configured table publish to Redis stream
+`<stream_prefix>:<topic>` (fields id/type/key/payload), with optional
+delete-after-publish. The outbox table is auto-excluded from the mirroring
+sinks and from backfill. Requires REDIS_URL.
+
 ## Architecture
 
 Hexagonal architecture with Uber FX dependency injection:
@@ -106,6 +112,7 @@ internal/
       redis/           # Redis stream sink + shared base/key templates
       redisjson/       # RedisJSON document sink
       meilisearch/     # Meilisearch indexing sink
+      outbox/          # Transactional outbox publisher (INSERTs -> events:<topic> streams)
   infrastructure/
     config/            # Configuration loading from env vars and sink YAML
     transform/         # Declarative per-sink transforms (CEL filters, masking)

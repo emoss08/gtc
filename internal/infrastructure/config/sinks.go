@@ -11,6 +11,67 @@ type SinksConfig struct {
 	RedisStream RedisKeyedSinkConfig  `yaml:"redis_stream"`
 	RedisJSON   RedisKeyedSinkConfig  `yaml:"redis_json"`
 	Meilisearch MeilisearchSinkConfig `yaml:"meilisearch"`
+	Outbox      OutboxConfig          `yaml:"outbox"`
+}
+
+// OutboxConfig enables the transactional-outbox sink: INSERTs into the
+// configured table are published as domain events to a Redis stream named by
+// the row's topic column, instead of the table being mirrored like data.
+type OutboxConfig struct {
+	// Table is the outbox table ("schema.table"; bare names default to the
+	// public schema). Setting it enables the outbox sink.
+	Table string `yaml:"table"`
+	// StreamPrefix prefixes destination streams: <prefix>:<topic>.
+	StreamPrefix string `yaml:"stream_prefix"`
+	// DefaultTopic is used when a row's topic column is null or empty.
+	// Without it, such rows are an error (visible, not silently dropped).
+	DefaultTopic string `yaml:"default_topic"`
+	// DeleteAfterPublish deletes each outbox row after successful publish,
+	// keeping the table small without a cleanup job.
+	DeleteAfterPublish bool          `yaml:"delete_after_publish"`
+	Columns            OutboxColumns `yaml:"columns"`
+}
+
+type OutboxColumns struct {
+	ID        string `yaml:"id"`
+	Topic     string `yaml:"topic"`
+	Key       string `yaml:"key"`
+	Payload   string `yaml:"payload"`
+	EventType string `yaml:"event_type"`
+}
+
+func (c *OutboxConfig) Enabled() bool { return c.Table != "" }
+
+func (c *OutboxConfig) applyDefaults() {
+	if c.StreamPrefix == "" {
+		c.StreamPrefix = "events"
+	}
+	if c.Columns.ID == "" {
+		c.Columns.ID = "id"
+	}
+	if c.Columns.Topic == "" {
+		c.Columns.Topic = "topic"
+	}
+	if c.Columns.Key == "" {
+		c.Columns.Key = "aggregate_id"
+	}
+	if c.Columns.Payload == "" {
+		c.Columns.Payload = "payload"
+	}
+	if c.Columns.EventType == "" {
+		c.Columns.EventType = "event_type"
+	}
+}
+
+// SchemaTable splits the configured table into schema and table, defaulting
+// the schema to "public".
+func (c *OutboxConfig) SchemaTable() (string, string) {
+	for i := 0; i < len(c.Table); i++ {
+		if c.Table[i] == '.' {
+			return c.Table[:i], c.Table[i+1:]
+		}
+	}
+	return "public", c.Table
 }
 
 // TransformSpec declares per-event transformations applied before a sink
@@ -169,6 +230,10 @@ func LoadSinksConfig() (*SinksConfig, error) {
 	if configPath == "" {
 		cfg.RedisStream.SyncAll = true
 		cfg.RedisJSON.SyncAll = true
+	}
+
+	if cfg.Outbox.Enabled() {
+		cfg.Outbox.applyDefaults()
 	}
 
 	return cfg, nil

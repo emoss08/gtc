@@ -145,6 +145,53 @@ meilisearch:
 	}
 }
 
+func TestOutboxConfigParsingAndDefaults(t *testing.T) {
+	input := `
+outbox:
+  table: app.domain_events
+  delete_after_publish: true
+  columns:
+    topic: destination
+`
+	var cfg SinksConfig
+	if err := yamlUnmarshal(t, input, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !cfg.Outbox.Enabled() {
+		t.Fatal("outbox with a table must be enabled")
+	}
+	cfg.Outbox.applyDefaults()
+
+	schema, table := cfg.Outbox.SchemaTable()
+	if schema != "app" || table != "domain_events" {
+		t.Errorf("unexpected schema.table: %s.%s", schema, table)
+	}
+	if cfg.Outbox.StreamPrefix != "events" {
+		t.Errorf("default stream prefix: %q", cfg.Outbox.StreamPrefix)
+	}
+	if cfg.Outbox.Columns.Topic != "destination" {
+		t.Errorf("overridden topic column: %q", cfg.Outbox.Columns.Topic)
+	}
+	if cfg.Outbox.Columns.Payload != "payload" || cfg.Outbox.Columns.ID != "id" {
+		t.Errorf("column defaults not applied: %+v", cfg.Outbox.Columns)
+	}
+	if !cfg.Outbox.DeleteAfterPublish {
+		t.Error("delete_after_publish not parsed")
+	}
+
+	// Bare table name defaults to the public schema.
+	bare := OutboxConfig{Table: "outbox"}
+	if s, tb := bare.SchemaTable(); s != "public" || tb != "outbox" {
+		t.Errorf("bare table: %s.%s", s, tb)
+	}
+
+	// Absent section stays disabled.
+	var empty SinksConfig
+	if empty.Outbox.Enabled() {
+		t.Error("outbox without a table must be disabled")
+	}
+}
+
 func TestLoadSinksConfigDefaultsToSyncAll(t *testing.T) {
 	t.Setenv("SINK_CONFIG_FILE", "")
 	cfg, err := LoadSinksConfig()
