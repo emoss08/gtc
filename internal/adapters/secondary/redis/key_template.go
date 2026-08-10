@@ -3,6 +3,7 @@ package redis
 import (
 	"bytes"
 	"fmt"
+	"sync"
 	"text/template"
 
 	"github.com/emoss08/gtc/internal/core/domain"
@@ -107,6 +108,8 @@ type KeyResolver struct {
 	resolver       PatternResolver
 	filter         TableFilter
 	prefixTemplate *KeyTemplate
+	defaultPattern string
+	mu             sync.Mutex
 	templateCache  map[string]*KeyTemplate
 }
 
@@ -114,6 +117,9 @@ type KeyResolverParams struct {
 	Resolver PatternResolver
 	Filter   TableFilter
 	Prefix   string
+	// DefaultPattern is used when the resolver has no pattern configured
+	// for a table.
+	DefaultPattern string
 }
 
 func NewKeyResolver(p KeyResolverParams) (*KeyResolver, error) {
@@ -122,10 +128,16 @@ func NewKeyResolver(p KeyResolverParams) (*KeyResolver, error) {
 		return nil, fmt.Errorf("invalid prefix template: %w", err)
 	}
 
+	defaultPattern := p.DefaultPattern
+	if defaultPattern == "" {
+		defaultPattern = DefaultStreamKeyPattern
+	}
+
 	return &KeyResolver{
 		resolver:       p.Resolver,
 		filter:         p.Filter,
 		prefixTemplate: prefixTmpl,
+		defaultPattern: defaultPattern,
 		templateCache:  make(map[string]*KeyTemplate),
 	}, nil
 }
@@ -152,16 +164,31 @@ func (kr *KeyResolver) GenerateKey(event domain.CDCEvent) (string, error) {
 	}
 
 	pattern := kr.resolver.GetKeyPattern(event.Schema, event.Table)
+	if pattern == "" {
+		pattern = kr.defaultPattern
+	}
 
-	tmpl, ok := kr.templateCache[pattern]
-	if !ok {
-		tmpl, err = ParseKeyTemplate(pattern)
-		if err != nil {
-			return "", fmt.Errorf("invalid pattern for %s.%s: %w", event.Schema, event.Table, err)
-		}
-		kr.templateCache[pattern] = tmpl
+	tmpl, err := kr.cachedTemplate(pattern, event)
+	if err != nil {
+		return "", err
 	}
 
 	ctx := NewKeyTemplateContext(prefix, event)
 	return tmpl.Execute(ctx)
+}
+
+func (kr *KeyResolver) cachedTemplate(pattern string, event domain.CDCEvent) (*KeyTemplate, error) {
+	kr.mu.Lock()
+	defer kr.mu.Unlock()
+
+	tmpl, ok := kr.templateCache[pattern]
+	if !ok {
+		var err error
+		tmpl, err = ParseKeyTemplate(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid pattern for %s.%s: %w", event.Schema, event.Table, err)
+		}
+		kr.templateCache[pattern] = tmpl
+	}
+	return tmpl, nil
 }

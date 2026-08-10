@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/emoss08/gtc/internal/core/ports"
+	"github.com/emoss08/gtc/internal/infrastructure/metrics"
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -32,7 +35,10 @@ type Reader struct {
 	conn      *pgconn.PgConn
 	decoder   *Decoder
 	clientLSN atomic.Uint64
+	streaming atomic.Bool
 	shutdown  chan struct{}
+	done      chan struct{}
+	stopOnce  sync.Once
 }
 
 func NewReader(cfg Config, logger *slog.Logger) *Reader {
@@ -41,10 +47,14 @@ func NewReader(cfg Config, logger *slog.Logger) *Reader {
 		logger:   logger.With(slog.String("component", "wal_reader")),
 		decoder:  NewDecoder(),
 		shutdown: make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 }
 
 func (r *Reader) Start(ctx context.Context, handler ports.WALEventHandler) error {
+	defer close(r.done)
+	defer r.closeConnection()
+
 	r.logger.Info("starting WAL reader",
 		slog.String("slot_name", r.config.SlotName),
 		slog.String("publication", r.config.PublicationName),
@@ -78,7 +88,7 @@ func (r *Reader) Start(ctx context.Context, handler ports.WALEventHandler) error
 
 		if err := r.setupReplication(ctx); err != nil {
 			r.logger.Error("replication setup failed", slog.String("error", err.Error()))
-			r.closeConnection(ctx)
+			r.closeConnection()
 			r.waitWithBackoff(ctx, backoff)
 			backoff = min(backoff*2, maxBackoff)
 			continue
@@ -94,11 +104,11 @@ func (r *Reader) Start(ctx context.Context, handler ports.WALEventHandler) error
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			r.logger.Error("stream loop failed, will reconnect",
+			r.logger.Error("stream loop failed, will reconnect and replay from last confirmed LSN",
 				slog.String("error", err.Error()),
 				slog.Duration("backoff", backoff),
 			)
-			r.closeConnection(ctx)
+			r.closeConnection()
 			r.waitWithBackoff(ctx, backoff)
 			backoff = min(backoff*2, maxBackoff)
 			continue
@@ -115,9 +125,11 @@ func (r *Reader) waitWithBackoff(ctx context.Context, backoff time.Duration) {
 	}
 }
 
-func (r *Reader) closeConnection(ctx context.Context) {
+func (r *Reader) closeConnection() {
 	if r.conn != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = r.conn.Close(ctx)
+		cancel()
 		r.conn = nil
 	}
 }
@@ -169,16 +181,16 @@ func (r *Reader) setupReplication(ctx context.Context) error {
 }
 
 func (r *Reader) ensurePublication(ctx context.Context) error {
-	checkResult := r.conn.Exec(ctx, fmt.Sprintf(
-		"SELECT 1 FROM pg_publication WHERE pubname = '%s'",
-		r.config.PublicationName,
-	))
-	rows, err := checkResult.ReadAll()
-	if err != nil {
-		return fmt.Errorf("check publication failed: %w", err)
+	checkResult := r.conn.ExecParams(ctx,
+		"SELECT 1 FROM pg_publication WHERE pubname = $1",
+		[][]byte{[]byte(r.config.PublicationName)},
+		nil, nil, nil,
+	).Read()
+	if checkResult.Err != nil {
+		return fmt.Errorf("check publication failed: %w", checkResult.Err)
 	}
 
-	if len(rows) > 0 && len(rows[0].Rows) > 0 {
+	if len(checkResult.Rows) > 0 {
 		r.logger.Info("publication exists", slog.String("publication", r.config.PublicationName))
 		return nil
 	}
@@ -191,11 +203,11 @@ func (r *Reader) ensurePublication(ctx context.Context) error {
 	}
 
 	r.logger.Info("creating publication", slog.String("publication", r.config.PublicationName))
-	result := r.conn.Exec(
-		ctx,
-		fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES", r.config.PublicationName),
-	)
-	if _, err = result.ReadAll(); err != nil {
+	result := r.conn.Exec(ctx, fmt.Sprintf(
+		"CREATE PUBLICATION %s FOR ALL TABLES",
+		pgx.Identifier{r.config.PublicationName}.Sanitize(),
+	))
+	if _, err := result.ReadAll(); err != nil {
 		return fmt.Errorf("create publication failed: %w", err)
 	}
 
@@ -204,17 +216,17 @@ func (r *Reader) ensurePublication(ctx context.Context) error {
 }
 
 func (r *Reader) ensureReplicationSlot(ctx context.Context) (pglogrepl.LSN, error) {
-	checkResult := r.conn.Exec(ctx, fmt.Sprintf(
-		"SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = '%s'",
-		r.config.SlotName,
-	))
-	rows, err := checkResult.ReadAll()
-	if err != nil {
-		return 0, fmt.Errorf("check replication slot failed: %w", err)
+	checkResult := r.conn.ExecParams(ctx,
+		"SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = $1",
+		[][]byte{[]byte(r.config.SlotName)},
+		nil, nil, nil,
+	).Read()
+	if checkResult.Err != nil {
+		return 0, fmt.Errorf("check replication slot failed: %w", checkResult.Err)
 	}
 
-	if len(rows) > 0 && len(rows[0].Rows) > 0 && len(rows[0].Rows[0]) > 0 {
-		lsnStr := string(rows[0].Rows[0][0])
+	if len(checkResult.Rows) > 0 && len(checkResult.Rows[0]) > 0 {
+		lsnStr := string(checkResult.Rows[0][0])
 		startLSN, parseErr := pglogrepl.ParseLSN(lsnStr)
 		if parseErr != nil {
 			return 0, fmt.Errorf("parse confirmed_flush_lsn failed: %w", parseErr)
@@ -258,11 +270,13 @@ func (r *Reader) ensureReplicationSlot(ctx context.Context) (pglogrepl.LSN, erro
 }
 
 func (r *Reader) startReplicationWithRetry(ctx context.Context, startLSN pglogrepl.LSN) error {
+	// Streaming of in-progress transactions is deliberately not requested:
+	// streamed changes can belong to transactions that later abort, and
+	// delivering them to sinks before commit would publish phantom data.
 	pluginArguments := []string{
 		"proto_version '2'",
 		fmt.Sprintf("publication_names '%s'", r.config.PublicationName),
-		"messages 'true'",
-		"streaming 'true'",
+		"messages 'false'",
 	}
 
 	deadline := time.Now().Add(r.config.SlotRetryTimeout)
@@ -299,6 +313,9 @@ func (r *Reader) startReplicationWithRetry(ctx context.Context, startLSN pglogre
 }
 
 func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) error {
+	r.streaming.Store(true)
+	defer r.streaming.Store(false)
+
 	nextDeadline := time.Now().Add(r.config.StandbyTimeout)
 	eventsProcessed := int64(0)
 
@@ -361,6 +378,10 @@ func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) 
 				slog.Int("xid", int(event.Metadata.TransactionID)),
 			)
 
+			// A handler error means at least one sink did not durably
+			// process the event. Returning the error tears down the
+			// connection without confirming the transaction's LSN, so the
+			// server redelivers it on reconnect (at-least-once delivery).
 			if err := handler(ctx, event); err != nil {
 				r.logger.Error("handler failed",
 					slog.String("error", err.Error()),
@@ -371,8 +392,22 @@ func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) 
 			eventsProcessed++
 		}
 
-		if uint64(result.LSN) > r.clientLSN.Load() {
-			r.clientLSN.Store(uint64(result.LSN))
+		if uint64(result.AckLSN) > r.clientLSN.Load() {
+			r.clientLSN.Store(uint64(result.AckLSN))
+			metrics.LastProcessedLSN.Set(float64(result.AckLSN))
+		}
+		if result.ServerWALEnd > 0 {
+			if lag := int64(uint64(result.ServerWALEnd) - r.clientLSN.Load()); lag >= 0 {
+				metrics.WALLagBytes.Set(float64(lag))
+			}
+		}
+
+		if result.RequestReply {
+			if err := r.sendStandbyStatus(ctx); err != nil {
+				r.logger.Error("failed to send requested standby status", slog.String("error", err.Error()))
+				return err
+			}
+			nextDeadline = time.Now().Add(r.config.StandbyTimeout)
 		}
 	}
 }
@@ -389,21 +424,29 @@ func (r *Reader) sendStandbyStatus(ctx context.Context) error {
 	)
 }
 
+// Stop signals the reader to shut down and waits for the streaming goroutine
+// to exit (bounded by ctx). The connection is owned and closed by Start's
+// goroutine; closing it here would race with an in-flight ReceiveMessage.
 func (r *Reader) Stop(ctx context.Context) error {
 	r.logger.Info("stopping WAL reader")
-	close(r.shutdown)
+	r.stopOnce.Do(func() { close(r.shutdown) })
 
-	if r.conn != nil {
-		if err := r.conn.Close(ctx); err != nil {
-			r.logger.Error("failed to close connection", slog.String("error", err.Error()))
-			return err
-		}
+	select {
+	case <-r.done:
+		r.logger.Info("WAL reader stopped")
+		return nil
+	case <-ctx.Done():
+		r.logger.Warn("timed out waiting for WAL reader to stop")
+		return ctx.Err()
 	}
-
-	r.logger.Info("WAL reader stopped")
-	return nil
 }
 
 func (r *Reader) CurrentLSN() string {
 	return pglogrepl.LSN(r.clientLSN.Load()).String()
+}
+
+// Streaming reports whether the reader currently has a live replication
+// stream. Used for readiness checks.
+func (r *Reader) Streaming() bool {
+	return r.streaming.Load()
 }

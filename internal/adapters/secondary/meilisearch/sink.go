@@ -4,10 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/meilisearch/meilisearch-go"
 )
+
+// taskPollInterval is how often the sink polls Meilisearch for task
+// completion; the overall wait is bounded by the caller's context.
+const taskPollInterval = 50 * time.Millisecond
 
 type Sink struct {
 	client meilisearch.ServiceManager
@@ -40,7 +45,7 @@ func (s *Sink) Name() string {
 func (s *Sink) Initialize(ctx context.Context) error {
 	s.logger.Debug("initializing meilisearch sink")
 
-	if _, err := s.client.Health(); err != nil {
+	if _, err := s.client.HealthWithContext(ctx); err != nil {
 		s.logger.Error("failed to connect to meilisearch", slog.String("error", err.Error()))
 		return err
 	}
@@ -70,13 +75,28 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 			return nil
 		}
 
-		if _, err := index.AddDocuments([]map[string]any{event.NewData}, nil); err != nil {
-			s.logger.Error("failed to add document",
+		docs := []map[string]any{event.NewData}
+		var task *meilisearch.TaskInfo
+		var err error
+		if event.Operation == domain.OperationInsert {
+			task, err = index.AddDocumentsWithContext(ctx, docs, nil)
+		} else {
+			// Partial update: fields omitted from NewData (e.g. unchanged
+			// TOAST columns) keep their previously indexed values instead
+			// of being wiped by a full document replacement.
+			task, err = index.UpdateDocumentsWithContext(ctx, docs, nil)
+		}
+		if err != nil {
+			s.logger.Error("failed to write document",
 				slog.String("error", err.Error()),
 				slog.String("index", indexName),
 				slog.String("event_id", event.ID),
 			)
-			return fmt.Errorf("add document: %w", err)
+			return fmt.Errorf("write document: %w", err)
+		}
+
+		if err := s.awaitTask(ctx, task, indexName, event.ID); err != nil {
+			return err
 		}
 
 		s.logger.Debug("document added/updated",
@@ -101,7 +121,8 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 			return nil
 		}
 
-		if _, err := index.DeleteDocument(fmt.Sprintf("%v", id)); err != nil {
+		task, err := index.DeleteDocumentWithContext(ctx, fmt.Sprintf("%v", id))
+		if err != nil {
 			s.logger.Error("failed to delete document",
 				slog.String("error", err.Error()),
 				slog.String("index", indexName),
@@ -110,13 +131,18 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 			return fmt.Errorf("delete document: %w", err)
 		}
 
+		if err := s.awaitTask(ctx, task, indexName, event.ID); err != nil {
+			return err
+		}
+
 		s.logger.Debug("document deleted",
 			slog.String("index", indexName),
 			slog.Any("document_id", id),
 		)
 
 	case domain.OperationTruncate:
-		if _, err := index.DeleteAllDocuments(); err != nil {
+		task, err := index.DeleteAllDocumentsWithContext(ctx)
+		if err != nil {
 			s.logger.Error("failed to delete all documents",
 				slog.String("error", err.Error()),
 				slog.String("index", indexName),
@@ -124,9 +150,40 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 			return fmt.Errorf("delete all documents: %w", err)
 		}
 
+		if err := s.awaitTask(ctx, task, indexName, event.ID); err != nil {
+			return err
+		}
+
 		s.logger.Info("all documents deleted (truncate)",
 			slog.String("index", indexName),
 		)
+	}
+
+	return nil
+}
+
+// awaitTask blocks until the asynchronous Meilisearch task finishes and
+// surfaces indexing failures (bad primary key, schema errors) that a plain
+// enqueue would silently swallow.
+func (s *Sink) awaitTask(
+	ctx context.Context,
+	taskInfo *meilisearch.TaskInfo,
+	indexName, eventID string,
+) error {
+	task, err := s.client.WaitForTaskWithContext(ctx, taskInfo.TaskUID, taskPollInterval)
+	if err != nil {
+		return fmt.Errorf("wait for meilisearch task: %w", err)
+	}
+
+	if task.Status != meilisearch.TaskStatusSucceeded {
+		s.logger.Error("meilisearch task failed",
+			slog.String("index", indexName),
+			slog.String("event_id", eventID),
+			slog.String("status", string(task.Status)),
+			slog.String("task_error", task.Error.Message),
+		)
+		return fmt.Errorf("meilisearch task %d failed: %s (%s)",
+			task.UID, task.Error.Message, task.Error.Code)
 	}
 
 	return nil
@@ -140,6 +197,6 @@ func (s *Sink) Shutdown(_ context.Context) error {
 }
 
 func (s *Sink) HealthCheck(ctx context.Context) error {
-	_, err := s.client.Health()
+	_, err := s.client.HealthWithContext(ctx)
 	return err
 }

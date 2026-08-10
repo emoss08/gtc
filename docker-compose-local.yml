@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  # Redis Stack ships the RedisJSON module, needed for the RedisJSON sink.
+  # The plain stream sink works against vanilla Redis too.
+  redis:
+    image: redis/redis-stack-server:latest
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - redis-data:/data
+
+  # Optional: uncomment to try the Meilisearch sink. Remember it only indexes
+  # tables mapped under meilisearch.tables in SINK_CONFIG_FILE.
+  # meilisearch:
+  #   image: getmeili/meilisearch:v1.15
+  #   environment:
+  #     MEILI_MASTER_KEY: masterKey
+  #     MEILI_NO_ANALYTICS: "true"
+  #   ports:
+  #     - "7700:7700"
+
+  gtc:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres?replication=database
+      REDIS_URL: redis://redis:6379
+      REDIS_JSON_URL: redis://redis:6379
+      # SINK_CONFIG_FILE: /app/config/sinks.example.yaml
+      # MEILISEARCH_URL: http://meilisearch:7700
+      # MEILISEARCH_API_KEY: masterKey
+    ports:
+      - "8080:8080"
+
+volumes:
+  postgres-data:
+  redis-data:

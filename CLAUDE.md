@@ -4,14 +4,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GTC is a PostgreSQL Change Data Capture (CDC) platform written in Go. It captures changes directly from PostgreSQL WAL and routes them to configurable sinks (Redis streams, Meilisearch). Built with hexagonal architecture and Uber FX for dependency injection.
+GTC is a PostgreSQL Change Data Capture (CDC) platform written in Go. It captures changes directly from PostgreSQL WAL and routes them to configurable sinks (Redis streams, RedisJSON, Meilisearch). Built with hexagonal architecture and Uber FX for dependency injection.
 
-## Build and Run Commands
+## Build, Test, and Run Commands
 
 ```bash
 go build -o gateway ./cmd/gateway
+go test ./...
 go run ./cmd/gateway
 ```
+
+## Delivery Semantics
+
+GTC provides **at-least-once** delivery. The WAL position is only confirmed to
+PostgreSQL at transaction commit boundaries, after every sink has successfully
+processed every event in the transaction. If any sink fails, the replication
+connection is torn down and the unconfirmed events are redelivered on
+reconnect — so **sinks must tolerate duplicate events** (the built-in sinks are
+idempotent; stream consumers should dedupe by `event_id`).
+
+Consequences to keep in mind:
+
+- A sink that is down does not lose events; it stalls the pipeline (replication
+  slot WAL retention grows) until the sink recovers.
+- `CDC_PROCESS_TIMEOUT` (default 10s) must stay small enough that
+  sink-count × timeout is below PostgreSQL's `wal_sender_timeout` (default
+  60s), because sinks run synchronously with the WAL stream and standby
+  keepalives are not sent mid-event.
+- Unchanged TOAST columns are omitted from `NewData` (never sent as
+  placeholder strings) and listed in `UnchangedToastColumns`. Sinks handle
+  this with partial updates (Meilisearch `UpdateDocuments`, RedisJSON
+  `JSON.MERGE`).
 
 ## Environment Variables
 
@@ -19,47 +42,68 @@ go run ./cmd/gateway
 |----------|---------|-------------|
 | LOG_LEVEL | INFO | Log level: DEBUG, INFO, WARN, ERROR |
 | DATABASE_URL | postgres://...?replication=database | PostgreSQL connection (must include ?replication=database) |
+| HTTP_PORT | 8080 | Port for health/readiness/metrics HTTP server |
 | CDC_SLOT_NAME | cdc_demo_slot | Replication slot name |
 | CDC_PUBLICATION_NAME | cdc_demo_publication | Publication name |
+| CDC_AUTO_CREATE_SLOT | true | Create the replication slot if missing |
+| CDC_AUTO_CREATE_PUBLICATION | true | Create the publication (FOR ALL TABLES) if missing |
 | CDC_STANDBY_TIMEOUT | 10s | Standby message interval |
 | CDC_PARALLEL_SINKS | false | Process sinks in parallel |
-| CDC_PROCESS_TIMEOUT | 30s | Per-event processing timeout |
+| CDC_PROCESS_TIMEOUT | 10s | Per-sink, per-event processing timeout |
 | CDC_EXCLUDED_TABLES | - | Comma-separated tables to exclude (e.g., public.migrations,audit_logs) |
-| REDIS_URL | - | Redis connection (enables sink if set) |
+| CDC_SLOT_RETRY_INTERVAL | 5s | Wait between retries when the slot is busy |
+| CDC_SLOT_RETRY_TIMEOUT | 60s | Give up starting replication after this long |
+| CDC_MAX_RETRIES | 3 | Per-sink retry attempts before failing the event |
+| CDC_RETRY_BACKOFF_INITIAL | 100ms | Initial retry backoff |
+| CDC_RETRY_BACKOFF_MAX | 10s | Maximum retry backoff |
+| CDC_CIRCUIT_BREAKER_THRESHOLD | 5 | Consecutive failures before the circuit opens |
+| CDC_CIRCUIT_BREAKER_TIMEOUT | 30s | How long an open circuit stays open |
+| SINK_CONFIG_FILE | - | Path to per-table sink YAML (see config/sinks.example.yaml). Without it, Redis sinks mirror all tables |
+| REDIS_URL | - | Redis connection (enables stream sink if set) |
 | REDIS_STREAM_PREFIX | cdc | Stream key prefix |
 | REDIS_MAX_STREAM_LEN | 10000 | Max stream length |
+| REDIS_JSON_URL | - | Redis connection (enables RedisJSON sink if set) |
+| REDIS_JSON_PREFIX | cdc | RedisJSON key prefix |
 | MEILISEARCH_URL | - | Meilisearch URL (enables sink if set) |
 | MEILISEARCH_API_KEY | - | Meilisearch API key |
-| MEILISEARCH_TABLE_MAPPING | {} | JSON table-to-index mapping e.g. {"public.users":"users_idx"} |
+
+The Meilisearch sink only indexes tables mapped in `SINK_CONFIG_FILE` under
+`meilisearch.tables`. RedisJSON key patterns should only reference replica
+identity columns (normally the primary key); other columns are absent from
+DELETE events, which would make the delete target the wrong key.
 
 ## Architecture
 
 Hexagonal architecture with Uber FX dependency injection:
 
 ```
-cmd/gateway/           # FX bootstrap and module definitions
+cmd/gateway/           # FX bootstrap (main.go) and module wiring (modules.go)
 internal/
   core/
     domain/            # CDCEvent, Sink interface, domain errors
     ports/             # WALReader, CDCService, SinkRegistry interfaces
     services/          # CDCService and SinkRegistry implementations
   adapters/
-    primary/wal/       # PostgreSQL WAL reader and decoder
+    primary/wal/       # PostgreSQL WAL reader and pgoutput decoder
     secondary/
-      redis/           # Redis stream sink
+      redis/           # Redis stream sink + shared base/key templates
+      redisjson/       # RedisJSON document sink
       meilisearch/     # Meilisearch indexing sink
   infrastructure/
-    config/            # Configuration loading from env vars
-    resilience/        # Circuit breaker and retry logic
+    config/            # Configuration loading from env vars and sink YAML
+    resilience/        # Circuit breaker and retry wrapper for sinks
+    server/            # HTTP health/readiness/metrics server
+    metrics/           # Prometheus metrics
 ```
 
 ## Adding New Sinks
 
 1. Create package under `internal/adapters/secondary/<sink_name>/`
 2. Implement `domain.Sink` interface (Name, Initialize, Process, Shutdown, HealthCheck)
-3. Add config loading in the package
-4. Create FX module in `cmd/gateway/modules.go` with conditional loading
-5. Register sink using `fx.Annotate` with `group:"sinks"` tag
+3. Add config loading in the package (enable the sink when its URL env var is set)
+4. Register it in `newSinks` in `cmd/gateway/modules.go`, wrapped with `resilience.NewResilientSink`
+5. Sinks must be idempotent (at-least-once delivery) and must respect
+   `UnchangedToastColumns` if they replace whole documents
 
 ## Key Dependencies
 

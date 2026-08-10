@@ -8,24 +8,20 @@ import (
 )
 
 type SinksConfig struct {
-	RedisStream RedisStreamSinkConfig `yaml:"redis_stream"`
-	RedisJSON   RedisJSONSinkConfig   `yaml:"redis_json"`
+	RedisStream RedisKeyedSinkConfig  `yaml:"redis_stream"`
+	RedisJSON   RedisKeyedSinkConfig  `yaml:"redis_json"`
 	Meilisearch MeilisearchSinkConfig `yaml:"meilisearch"`
 }
 
-type RedisStreamSinkConfig struct {
+// RedisKeyedSinkConfig configures a Redis-backed sink whose keys are built
+// from a per-table key pattern. It is shared by the stream and JSON sinks.
+type RedisKeyedSinkConfig struct {
 	SyncAll           bool              `yaml:"sync_all"`
 	DefaultKeyPattern string            `yaml:"default_key_pattern"`
 	Tables            map[string]string `yaml:"tables"`
 }
 
-type RedisJSONSinkConfig struct {
-	SyncAll           bool              `yaml:"sync_all"`
-	DefaultKeyPattern string            `yaml:"default_key_pattern"`
-	Tables            map[string]string `yaml:"tables"`
-}
-
-func (c *RedisStreamSinkConfig) ShouldProcess(schema, table string) bool {
+func (c *RedisKeyedSinkConfig) ShouldProcess(schema, table string) bool {
 	fullName := fmt.Sprintf("%s.%s", schema, table)
 
 	if _, ok := c.Tables[fullName]; ok {
@@ -38,57 +34,24 @@ func (c *RedisStreamSinkConfig) ShouldProcess(schema, table string) bool {
 	return c.SyncAll
 }
 
-func (c *RedisJSONSinkConfig) ShouldProcess(schema, table string) bool {
+// GetKeyPattern returns the configured pattern for the table, or "" when
+// nothing is configured; the sink's key resolver applies its own default.
+func (c *RedisKeyedSinkConfig) GetKeyPattern(schema, table string) string {
 	fullName := fmt.Sprintf("%s.%s", schema, table)
 
-	if _, ok := c.Tables[fullName]; ok {
-		return true
-	}
-	if _, ok := c.Tables[table]; ok {
-		return true
+	if pattern, ok := c.Tables[fullName]; ok {
+		return pattern
 	}
 
-	return c.SyncAll
+	if pattern, ok := c.Tables[table]; ok {
+		return pattern
+	}
+
+	return c.DefaultKeyPattern
 }
 
 type MeilisearchSinkConfig struct {
 	Tables map[string]string `yaml:"tables"`
-}
-
-func (c *RedisStreamSinkConfig) GetKeyPattern(schema, table string) string {
-	fullName := fmt.Sprintf("%s.%s", schema, table)
-
-	if pattern, ok := c.Tables[fullName]; ok {
-		return pattern
-	}
-
-	if pattern, ok := c.Tables[table]; ok {
-		return pattern
-	}
-
-	if c.DefaultKeyPattern != "" {
-		return c.DefaultKeyPattern
-	}
-
-	return "{{.Prefix}}:{{.Schema}}:{{.Table}}"
-}
-
-func (c *RedisJSONSinkConfig) GetKeyPattern(schema, table string) string {
-	fullName := fmt.Sprintf("%s.%s", schema, table)
-
-	if pattern, ok := c.Tables[fullName]; ok {
-		return pattern
-	}
-
-	if pattern, ok := c.Tables[table]; ok {
-		return pattern
-	}
-
-	if c.DefaultKeyPattern != "" {
-		return c.DefaultKeyPattern
-	}
-
-	return "{{.Prefix}}:{{.Schema}}:{{.Table}}:{{.Field \"id\"}}"
 }
 
 func (c *MeilisearchSinkConfig) GetIndex(schema, table string) (string, bool) {
@@ -106,29 +69,17 @@ func (c *MeilisearchSinkConfig) GetIndex(schema, table string) (string, bool) {
 }
 
 func LoadSinksConfig() (*SinksConfig, error) {
+	cfg := &SinksConfig{}
+
 	configPath := os.Getenv("SINK_CONFIG_FILE")
-	if configPath == "" {
-		return &SinksConfig{
-			RedisStream: RedisStreamSinkConfig{
-				Tables: make(map[string]string),
-			},
-			RedisJSON: RedisJSONSinkConfig{
-				Tables: make(map[string]string),
-			},
-			Meilisearch: MeilisearchSinkConfig{
-				Tables: make(map[string]string),
-			},
-		}, nil
-	}
-
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("read sinks config file: %w", err)
-	}
-
-	var cfg SinksConfig
-	if unmarshalErr := yaml.Unmarshal(data, &cfg); unmarshalErr != nil {
-		return nil, fmt.Errorf("parse sinks config: %w", unmarshalErr)
+	if configPath != "" {
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			return nil, fmt.Errorf("read sinks config file: %w", err)
+		}
+		if unmarshalErr := yaml.Unmarshal(data, cfg); unmarshalErr != nil {
+			return nil, fmt.Errorf("parse sinks config: %w", unmarshalErr)
+		}
 	}
 
 	if cfg.RedisStream.Tables == nil {
@@ -141,5 +92,11 @@ func LoadSinksConfig() (*SinksConfig, error) {
 		cfg.Meilisearch.Tables = make(map[string]string)
 	}
 
-	return &cfg, nil
+	// Plug-and-play default: with no sink config file, mirror every table.
+	if configPath == "" {
+		cfg.RedisStream.SyncAll = true
+		cfg.RedisJSON.SyncAll = true
+	}
+
+	return cfg, nil
 }
