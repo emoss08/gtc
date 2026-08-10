@@ -47,3 +47,19 @@ meilisearch:
       index: users
       mask:
         email: redact
+
+# Transactional outbox: INSERTs into this table are published as messages to
+# the Redis stream <stream_prefix>:<topic column value>, instead of the table
+# being mirrored like data. The table is automatically excluded from the
+# other sinks and from backfill. Requires REDIS_URL.
+# outbox:
+#   table: public.outbox
+#   stream_prefix: events          # destination: events:<topic>
+#   default_topic: ""              # used when a row's topic is null/empty
+#   delete_after_publish: false    # delete rows once published
+#   columns:                       # all optional; defaults shown
+#     id: id                       # message id (consumers dedupe on this)
+#     topic: topic                 # destination stream suffix
+#     key: aggregate_id            # optional partition/aggregate key
+#     payload: payload             # message body (jsonb/json/text)
+#     event_type: event_type       # optional message type field

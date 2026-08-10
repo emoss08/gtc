@@ -46,6 +46,10 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
   `null`), column dropping, and CEL row filters, configured per sink and per
   table in YAML. The stream can carry full rows while the search index gets
   masked ones — no plugin code, no SMT classes.
+- **First-class transactional outbox** — write domain events to an outbox
+  table in the same transaction as your business writes, and GTC publishes
+  them to per-topic Redis streams with optional delete-after-publish. Five
+  lines of YAML instead of Debezium's SMT routing configuration.
 - **Resilience** — per-sink retries with exponential backoff and a circuit
   breaker that fails fast while a sink is down (the WAL position simply
   doesn't advance until it recovers).
@@ -234,6 +238,51 @@ columns. Filtered events count in `cdc_events_filtered_total{sink,schema,table}`
 > so a key built from them would miss the document it is meant to delete.
 > The Meilisearch sink expects documents to have an `id` column.
 
+### Transactional outbox
+
+The [outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html)
+is the reliable way to publish domain events: write the event to an outbox
+table **in the same transaction** as your business change, and let CDC turn
+it into a message — no dual-write race, no lost events. GTC makes it a config
+block:
+
+```yaml
+outbox:
+  table: public.outbox
+  delete_after_publish: true
+```
+
+```sql
+CREATE TABLE outbox (
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  topic        text NOT NULL,          -- destination stream: events:<topic>
+  event_type   text,                   -- e.g. OrderPlaced
+  aggregate_id text,                   -- e.g. the order id
+  payload      jsonb NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- In your application, inside the business transaction:
+INSERT INTO outbox (topic, event_type, aggregate_id, payload)
+VALUES ('orders', 'OrderPlaced', '42', '{"total": 99}');
+```
+
+Each INSERT is published to the Redis stream `events:<topic>` with fields
+`id` (dedupe key), `type`, `key`, and `payload`. Column names, the stream
+prefix, and a fallback `default_topic` are configurable (see
+[`config/sinks.example.yaml`](config/sinks.example.yaml)).
+
+Behavior worth knowing:
+
+- The outbox table is **automatically excluded** from the data-mirroring
+  sinks and from backfill — its rows are messages, not data, and a backfill
+  must not republish history.
+- With `delete_after_publish: true`, rows are deleted once published (a
+  failed delete is logged and left for cleanup — the message is already
+  out, so it never blocks the pipeline).
+- Delivery is at-least-once like everything else; consumers dedupe by the
+  `id` field.
+
 ## Backfill and replay
 
 GTC syncs *existing* data, not just new changes. When the replication slot is
@@ -321,6 +370,7 @@ internal/
       redis/           # Redis Stream sink + shared base/key templates
       redisjson/       # RedisJSON document sink
       meilisearch/     # Meilisearch indexing sink
+      outbox/          # Transactional outbox publisher
   infrastructure/
     config/            # Env + sink YAML loading
     resilience/        # Retry + circuit breaker wrapper for sinks
