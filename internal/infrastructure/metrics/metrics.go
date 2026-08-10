@@ -101,4 +101,13 @@ var (
 			Help:      "Last processed LSN as uint64",
 		},
 	)
+
+	BackfillRowsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "cdc",
+			Name:      "backfill_rows_total",
+			Help:      "Total rows delivered to sinks by backfill",
+		},
+		[]string{"schema", "table"},
+	)
 )

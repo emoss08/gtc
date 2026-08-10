@@ -34,6 +34,9 @@ func NewDecoder() *Decoder {
 
 type DecodeResult struct {
 	Events []domain.CDCEvent
+	// Message is a logical decoding message (pg_logical_emit_message)
+	// found at this stream position; used for backfill watermarks.
+	Message *LogicalMessage
 	// AckLSN, when non-zero, is a position that is safe to confirm to the
 	// server: either the end of a committed transaction whose events have
 	// all been emitted, or the server's WAL end from a keepalive received
@@ -45,6 +48,12 @@ type DecodeResult struct {
 	// RequestReply is set when the server asked for an immediate standby
 	// status update.
 	RequestReply bool
+}
+
+type LogicalMessage struct {
+	Prefix  string
+	Content []byte
+	LSN     pglogrepl.LSN
 }
 
 func (d *Decoder) Decode(rawMsg pgproto3.BackendMessage) (*DecodeResult, error) {
@@ -149,6 +158,13 @@ func (d *Decoder) decodeWALData(walData []byte, lsn pglogrepl.LSN) (*DecodeResul
 			result.Events = append(result.Events, event)
 		}
 
+	case *pglogrepl.LogicalDecodingMessageV2:
+		result.Message = &LogicalMessage{
+			Prefix:  msg.Prefix,
+			Content: msg.Content,
+			LSN:     msg.LSN,
+		}
+
 	case *pglogrepl.StreamStartMessageV2, *pglogrepl.StreamStopMessageV2,
 		*pglogrepl.StreamCommitMessageV2, *pglogrepl.StreamAbortMessageV2:
 		// Streaming of in-progress transactions is not requested; receiving
@@ -224,6 +240,13 @@ func (d *Decoder) decodeTuple(
 }
 
 func (d *Decoder) decodeTextColumn(data []byte, dataType uint32) (any, error) {
+	return DecodeText(d.typeMap, dataType, data)
+}
+
+// DecodeText converts a column's Postgres text representation into a Go value
+// suitable for JSON serialization. It is shared by the WAL decoder and the
+// backfill chunk reader so streamed and backfilled rows use identical types.
+func DecodeText(typeMap *pgtype.Map, dataType uint32, data []byte) (any, error) {
 	// pgtype decodes some types into Go values that do not serialize to
 	// JSON the way consumers expect (UUID becomes [16]byte, numeric becomes
 	// a struct). Postgres's text representation is already exact and
@@ -232,8 +255,8 @@ func (d *Decoder) decodeTextColumn(data []byte, dataType uint32) (any, error) {
 	case pgtype.UUIDOID, pgtype.NumericOID:
 		return string(data), nil
 	}
-	if dt, ok := d.typeMap.TypeForOID(dataType); ok {
-		return dt.Codec.DecodeValue(d.typeMap, dataType, pgtype.TextFormatCode, data)
+	if dt, ok := typeMap.TypeForOID(dataType); ok {
+		return dt.Codec.DecodeValue(typeMap, dataType, pgtype.TextFormatCode, data)
 	}
 	return string(data), nil
 }

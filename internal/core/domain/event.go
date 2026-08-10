@@ -12,6 +12,10 @@ const (
 	OperationUpdate
 	OperationDelete
 	OperationTruncate
+	// OperationRead is a row emitted by a backfill (initial snapshot or
+	// replay), not by a live change. Sinks treat it like an insert of the
+	// row's current state.
+	OperationRead
 )
 
 func (o Operation) String() string {
@@ -24,6 +28,8 @@ func (o Operation) String() string {
 		return "DELETE"
 	case OperationTruncate:
 		return "TRUNCATE"
+	case OperationRead:
+		return "READ"
 	default:
 		return "UNKNOWN"
 	}

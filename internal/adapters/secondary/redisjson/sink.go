@@ -56,7 +56,7 @@ func (s *JSONSink) Process(ctx context.Context, event domain.CDCEvent) error {
 	}
 
 	switch event.Operation {
-	case domain.OperationInsert, domain.OperationUpdate:
+	case domain.OperationInsert, domain.OperationUpdate, domain.OperationRead:
 		return s.setJSON(ctx, key, event)
 	case domain.OperationDelete:
 		return s.deleteKey(ctx, key, event)

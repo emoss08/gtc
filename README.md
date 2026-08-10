@@ -24,6 +24,11 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
 - **Single binary, plug and play** — point it at a database with
   `wal_level=logical`, set a Redis URL, and every table is mirrored. The
   replication slot and publication are created automatically.
+- **Lock-free initial backfill** — on first start, existing table data is
+  synced to the sinks *concurrently with live streaming* using watermark
+  chunking (the DBLog algorithm): no table locks, no paused replication, and
+  progress survives restarts. New tables (or re-syncs) can be backfilled at
+  any time via the HTTP API.
 - **At-least-once delivery** — the WAL position is confirmed to PostgreSQL
   only at transaction commit boundaries, after every sink has processed every
   event. A failed sink means teardown and replay, never silent loss.
@@ -147,6 +152,10 @@ lives in an optional YAML file.
 | `CDC_RETRY_BACKOFF_MAX` | `10s` | Maximum retry backoff |
 | `CDC_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before the circuit opens |
 | `CDC_CIRCUIT_BREAKER_TIMEOUT` | `30s` | How long an open circuit stays open |
+| `CDC_BACKFILL_MODE` | `auto` | `auto` backfills all tables when the slot is first created; `manual` via API only; `off` disables |
+| `CDC_BACKFILL_CHUNK_SIZE` | `1000` | Rows per backfill chunk |
+| `CDC_BACKFILL_CHUNK_DELAY` | `0` | Pause between chunks (throttle source load) |
+| `CDC_BACKFILL_STATE_TABLE` | `gtc_backfill_state` | Progress table in the source DB (`none` disables resume) |
 | `SINK_CONFIG_FILE` | – | Path to the per-table sink YAML (below) |
 | `REDIS_URL` | – | Enables the Redis Stream sink |
 | `REDIS_STREAM_PREFIX` | `cdc` | Stream key prefix |
@@ -187,6 +196,36 @@ Key patterns are Go templates with access to `{{.Prefix}}`, `{{.Schema}}`,
 > so a key built from them would miss the document it is meant to delete.
 > The Meilisearch sink expects documents to have an `id` column.
 
+## Backfill and replay
+
+GTC syncs *existing* data, not just new changes. When the replication slot is
+first created (a brand-new deployment), every table in the publication is
+backfilled automatically. The algorithm is the watermark approach from
+Netflix's DBLog paper:
+
+1. Rows are read in primary-key-ordered chunks over a **regular** connection —
+   no locks, no long-running snapshot transaction.
+2. Each chunk is bracketed by low/high watermarks written into the WAL via
+   `pg_logical_emit_message()`, so the watermarks travel *inside* the
+   replication stream.
+3. Any live change observed between the watermarks supersedes the matching
+   chunk row; the remaining rows are emitted as `READ` events exactly at the
+   high watermark's stream position. Per-key ordering holds, and live
+   streaming never pauses.
+
+Progress is persisted per table (in `gtc_backfill_state` in the source
+database), so an interrupted backfill resumes where it left off. Tables
+without a primary key are skipped with a warning.
+
+The HTTP API doubles as a **replay** mechanism — re-sync a table into the
+sinks at any time (e.g. after wiping a search index):
+
+```bash
+curl -X POST localhost:8080/backfill -d '{"table":"public.products"}'
+curl -X POST localhost:8080/backfill -d '{"all":true}'
+curl localhost:8080/backfill            # per-table progress
+```
+
 ## Delivery semantics
 
 GTC is **at-least-once**:
@@ -216,6 +255,8 @@ Consequences worth knowing:
 | `GET /health` | Liveness — process is up |
 | `GET /readiness` | Readiness — live replication stream **and** all sinks healthy |
 | `GET /metrics` | Prometheus metrics |
+| `GET /backfill` | Backfill progress per table |
+| `POST /backfill` | Trigger a backfill/replay (`{"table":"schema.table"}` or `{"all":true}`) |
 
 Key metrics (all prefixed `cdc_`): `events_received_total`,
 `events_processed_total{sink,status}`, `event_processing_duration_seconds`,
@@ -237,6 +278,7 @@ internal/
     services/          # CDC orchestration and sink registry
   adapters/
     primary/wal/       # Replication connection + pgoutput decoder
+    primary/backfill/  # Watermark-based chunked backfill coordinator
     secondary/
       redis/           # Redis Stream sink + shared base/key templates
       redisjson/       # RedisJSON document sink

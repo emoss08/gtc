@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
+	"github.com/emoss08/gtc/internal/adapters/primary/backfill"
 	"github.com/emoss08/gtc/internal/adapters/primary/wal"
 	meilisink "github.com/emoss08/gtc/internal/adapters/secondary/meilisearch"
 	redissink "github.com/emoss08/gtc/internal/adapters/secondary/redis"
@@ -26,6 +28,7 @@ func Module() fx.Option {
 		fx.Provide(
 			config.Load,
 			config.LoadSinksConfig,
+			newBackfillCoordinator,
 			newWALReader,
 			func(r *wal.Reader) ports.WALReader { return r },
 			newSinks,
@@ -38,8 +41,35 @@ func Module() fx.Option {
 	)
 }
 
-func newWALReader(cfg *config.Config, logger *slog.Logger) *wal.Reader {
-	return wal.NewReader(wal.Config{
+// newBackfillCoordinator returns nil when backfill is disabled.
+func newBackfillCoordinator(cfg *config.Config, logger *slog.Logger) (*backfill.Coordinator, error) {
+	if cfg.Backfill.Mode == "off" {
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	db, err := backfill.NewDB(ctx, cfg.DatabaseURL, cfg.Backfill.StateTable)
+	if err != nil {
+		return nil, err
+	}
+
+	return backfill.NewCoordinator(db, backfill.Config{
+		SlotName:        cfg.SlotName,
+		PublicationName: cfg.PublicationName,
+		ChunkSize:       cfg.Backfill.ChunkSize,
+		ChunkDelay:      cfg.Backfill.ChunkDelay,
+		ExcludedTables:  cfg.ExcludedTables,
+	}, logger), nil
+}
+
+func newWALReader(
+	cfg *config.Config,
+	coordinator *backfill.Coordinator,
+	logger *slog.Logger,
+) *wal.Reader {
+	walCfg := wal.Config{
 		DatabaseURL:       cfg.DatabaseURL,
 		SlotName:          cfg.SlotName,
 		PublicationName:   cfg.PublicationName,
@@ -48,7 +78,31 @@ func newWALReader(cfg *config.Config, logger *slog.Logger) *wal.Reader {
 		AutoCreatePub:     cfg.AutoCreatePub,
 		SlotRetryInterval: cfg.SlotRetryInterval,
 		SlotRetryTimeout:  cfg.SlotRetryTimeout,
-	}, logger)
+	}
+
+	if coordinator != nil {
+		walCfg.Controller = coordinator
+		if cfg.Backfill.Mode == "auto" {
+			// A freshly created slot means a brand-new deployment whose
+			// sinks are empty: backfill everything, once.
+			var once sync.Once
+			walCfg.StreamStarted = func(slotCreated bool) {
+				if !slotCreated {
+					return
+				}
+				once.Do(func() {
+					go func() {
+						if err := coordinator.EnqueueAll(context.Background()); err != nil {
+							logger.Error("failed to enqueue initial backfill",
+								slog.String("error", err.Error()))
+						}
+					}()
+				})
+			}
+		}
+	}
+
+	return wal.NewReader(walCfg, logger)
 }
 
 // newSinks builds every sink whose backing store is configured (presence of
@@ -136,6 +190,16 @@ func newCDCService(
 	registry ports.SinkRegistry,
 	logger *slog.Logger,
 ) ports.CDCService {
+	// The backfill progress table lives in the source database and churns
+	// constantly during a backfill; never mirror it to sinks.
+	excluded := make(map[string]struct{}, len(cfg.ExcludedTables)+1)
+	for t := range cfg.ExcludedTables {
+		excluded[t] = struct{}{}
+	}
+	if cfg.Backfill.Mode != "off" && cfg.Backfill.StateTable != "" {
+		excluded[cfg.Backfill.StateTable] = struct{}{}
+	}
+
 	return services.NewCDCService(services.CDCServiceParams{
 		WALReader: reader,
 		Registry:  registry,
@@ -143,20 +207,26 @@ func newCDCService(
 		Config: services.CDCServiceConfig{
 			ParallelSinks:  cfg.ParallelSinks,
 			ProcessTimeout: cfg.ProcessTimeout,
-			ExcludedTables: cfg.ExcludedTables,
+			ExcludedTables: excluded,
 		},
 	})
 }
 
 func newHTTPServer(
 	cfg *config.Config,
+	coordinator *backfill.Coordinator,
 	health *server.HealthStatus,
 	logger *slog.Logger,
 ) *server.Server {
+	var manager ports.BackfillManager
+	if coordinator != nil {
+		manager = coordinator
+	}
 	return server.New(server.ServerParams{
-		Config:  server.Config{Port: cfg.HTTPPort},
-		Checker: health,
-		Logger:  logger,
+		Config:   server.Config{Port: cfg.HTTPPort},
+		Checker:  health,
+		Backfill: manager,
+		Logger:   logger,
 	})
 }
 
@@ -168,6 +238,7 @@ func run(
 	health *server.HealthStatus,
 	registry ports.SinkRegistry,
 	reader *wal.Reader,
+	coordinator *backfill.Coordinator,
 	logger *slog.Logger,
 ) {
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -175,6 +246,10 @@ func run(
 
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
+			if coordinator != nil {
+				coordinator.Start(runCtx)
+			}
+
 			go func() {
 				if err := svc.Start(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 					logger.Error("CDC service exited", slog.String("error", err.Error()))
@@ -206,6 +281,9 @@ func run(
 			err := svc.Stop(ctx)
 			if srvErr := srv.Stop(ctx); srvErr != nil {
 				logger.Error("failed to stop HTTP server", slog.String("error", srvErr.Error()))
+			}
+			if coordinator != nil {
+				coordinator.Close()
 			}
 			return err
 		},

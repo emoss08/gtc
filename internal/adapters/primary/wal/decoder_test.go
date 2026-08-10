@@ -278,6 +278,33 @@ func TestNonCopyDataMessagesAreIgnored(t *testing.T) {
 	}
 }
 
+func TestLogicalMessageDecodesToWatermark(t *testing.T) {
+	d := NewDecoder()
+
+	// Message: 'M' + flags(1) + lsn(8) + prefix cstring + content len(4) + content.
+	content := []byte(`{"slot":"s","chunk":"c1","mark":"low"}`)
+	body := []byte{'M', 0}
+	body = binary.BigEndian.AppendUint64(body, 500)
+	body = append(body, WatermarkPrefix...)
+	body = append(body, 0)
+	body = binary.BigEndian.AppendUint32(body, uint32(len(content)))
+	body = append(body, content...)
+
+	result := decodeAt(t, d, 500, body)
+	if result.Message == nil {
+		t.Fatal("expected a logical message")
+	}
+	if result.Message.Prefix != WatermarkPrefix {
+		t.Errorf("expected prefix %q, got %q", WatermarkPrefix, result.Message.Prefix)
+	}
+	if string(result.Message.Content) != string(content) {
+		t.Errorf("content mismatch: %s", result.Message.Content)
+	}
+	if len(result.Events) != 0 || result.AckLSN != 0 {
+		t.Errorf("logical message must not produce events or acks: %+v", result)
+	}
+}
+
 func TestStreamedMessagesAreRejected(t *testing.T) {
 	d := NewDecoder()
 	// Stream Start: 'S' + xid + first-segment flag.
