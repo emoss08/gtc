@@ -1,5 +1,6 @@
 # GTC — Go Change Data Capture for PostgreSQL
 
+[![CI](https://github.com/emoss08/gtc/actions/workflows/ci.yml/badge.svg)](https://github.com/emoss08/gtc/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/go-1.25-00ADD8?logo=go)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
