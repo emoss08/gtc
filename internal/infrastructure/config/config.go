@@ -22,6 +22,19 @@ type Config struct {
 	SlotRetryInterval time.Duration
 	SlotRetryTimeout  time.Duration
 	Backfill          BackfillConfig
+	DLQ               DLQConfig
+}
+
+type DLQConfig struct {
+	// Enabled turns on dead-lettering (requires REDIS_URL; without it the
+	// DLQ is silently unavailable and failures always stall the pipeline).
+	Enabled bool
+	// Threshold is how many full failure cycles (resilience retries plus
+	// stream replay) the same event must go through before it is parked.
+	Threshold int
+	// MaxEntries caps the queue; when full, parking fails and the
+	// pipeline stalls rather than dropping events.
+	MaxEntries int64
 }
 
 type BackfillConfig struct {

@@ -17,6 +17,7 @@ import (
 	"github.com/emoss08/gtc/internal/core/ports"
 	"github.com/emoss08/gtc/internal/core/services"
 	"github.com/emoss08/gtc/internal/infrastructure/config"
+	"github.com/emoss08/gtc/internal/infrastructure/dlq"
 	"github.com/emoss08/gtc/internal/infrastructure/resilience"
 	"github.com/emoss08/gtc/internal/infrastructure/server"
 	"github.com/emoss08/gtc/internal/infrastructure/transform"
@@ -31,6 +32,7 @@ func Module() fx.Option {
 			config.Load,
 			config.LoadSinksConfig,
 			newBackfillCoordinator,
+			newDLQManager,
 			newWALReader,
 			func(r *wal.Reader) ports.WALReader { return r },
 			newSinks,
@@ -80,6 +82,30 @@ func newBackfillCoordinator(
 	}, logger), nil
 }
 
+// newDLQManager returns nil when the DLQ is disabled or Redis is not
+// configured; failures then always stall the pipeline (the safe default).
+func newDLQManager(cfg *config.Config, logger *slog.Logger) (*dlq.Manager, error) {
+	rc := redissink.LoadConfig()
+	if !cfg.DLQ.Enabled || rc.URL == "" {
+		if cfg.DLQ.Enabled {
+			logger.Info("dead-letter queue unavailable without REDIS_URL; sink failures will stall the pipeline")
+		}
+		return nil, nil
+	}
+
+	store, err := dlq.NewRedisStore(rc.URL, rc.StreamPrefix, cfg.DLQ.MaxEntries)
+	if err != nil {
+		return nil, err
+	}
+
+	return dlq.NewManager(dlq.ManagerParams{
+		Store:        store,
+		Threshold:    cfg.DLQ.Threshold,
+		RetryTimeout: cfg.ProcessTimeout,
+		Logger:       logger,
+	}), nil
+}
+
 func newWALReader(
 	cfg *config.Config,
 	coordinator *backfill.Coordinator,
@@ -127,6 +153,7 @@ func newWALReader(
 func newSinks(
 	cfg *config.Config,
 	sinksCfg *config.SinksConfig,
+	dlqManager *dlq.Manager,
 	logger *slog.Logger,
 ) ([]domain.Sink, error) {
 	resCfg := resilience.ResilienceConfig{
@@ -145,18 +172,26 @@ func newSinks(
 		outboxSchema, outboxTable = outboxCfg.SchemaTable()
 	}
 
-	// Each sink is wrapped resilience-first, then transforms, so retries
-	// operate on the already-transformed event and a filter/mask error is
-	// not treated as a sink failure by the circuit breaker. When an outbox
-	// is configured, its table is kept out of the data-mirroring sinks —
-	// outbox rows are messages, not data.
+	// Layering, innermost out: resilience (retries + breaker), then the
+	// DLQ (parks poison events, stores the resilience-wrapped sink as its
+	// retry target), then transforms — so retries and parked entries carry
+	// the already-transformed event and masking is never re-applied. When
+	// an outbox is configured, its table is kept out of the data-mirroring
+	// sinks — outbox rows are messages, not data.
+	wrapResilienceAndDLQ := func(sink domain.Sink) domain.Sink {
+		wrapped := domain.Sink(resilience.NewResilientSink(sink, resCfg))
+		if dlqManager != nil {
+			wrapped = dlqManager.WrapSink(wrapped)
+		}
+		return wrapped
+	}
+
 	addSink := func(
 		sink domain.Sink,
 		global *config.TransformSpec,
 		tables map[string]config.TransformSpec,
 	) error {
-		wrapped, err := transform.NewSink(
-			resilience.NewResilientSink(sink, resCfg), global, tables, logger)
+		wrapped, err := transform.NewSink(wrapResilienceAndDLQ(sink), global, tables, logger)
 		if err != nil {
 			return err
 		}
@@ -245,7 +280,7 @@ func newSinks(
 		}
 		// No transform wrapper: outbox rows are messages, and filtering or
 		// masking them belongs to whoever writes the outbox.
-		sinks = append(sinks, resilience.NewResilientSink(sink, resCfg))
+		sinks = append(sinks, wrapResilienceAndDLQ(sink))
 	}
 
 	return sinks, nil
@@ -286,17 +321,23 @@ func newCDCService(
 func newHTTPServer(
 	cfg *config.Config,
 	coordinator *backfill.Coordinator,
+	dlqManager *dlq.Manager,
 	health *server.HealthStatus,
 	logger *slog.Logger,
 ) *server.Server {
-	var manager ports.BackfillManager
+	var backfillManager ports.BackfillManager
 	if coordinator != nil {
-		manager = coordinator
+		backfillManager = coordinator
+	}
+	var dlqPort ports.DLQManager
+	if dlqManager != nil {
+		dlqPort = dlqManager
 	}
 	return server.New(server.ServerParams{
 		Config:   server.Config{Port: cfg.HTTPPort},
 		Checker:  health,
-		Backfill: manager,
+		Backfill: backfillManager,
+		DLQ:      dlqPort,
 		Logger:   logger,
 	})
 }
