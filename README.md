@@ -58,6 +58,10 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
   forever, then inspected, retried, or discarded over HTTP. Sink *outages*
   still stall (a down sink is not a poison event) — nothing is ever
   silently dropped.
+- **Embedded live dashboard** — a Svelte dashboard served from the binary at
+  `/` (PocketBase-style, no separate deployment): live throughput, WAL lag,
+  sink health and breaker states, per-table activity, backfill progress, and
+  DLQ triage with one-click retry/discard. Light and dark themes.
 - **Observability** — Prometheus metrics (events, per-sink latency, errors,
   retries, breaker state, WAL lag in bytes), health and readiness endpoints,
   structured JSON logs.
@@ -377,8 +381,24 @@ Set `CDC_DLQ_ENABLED=false` to opt out and always stall on failure.
 
 ## Observability
 
+### Dashboard
+
+Open `http://localhost:8080/` for the embedded dashboard: throughput with a
+live sparkline, WAL lag, in-flight events, sink health with circuit-breaker
+states, per-table operation counts, backfill progress (with a "sync all"
+trigger), and dead-letter triage with retry/discard buttons. It's a Svelte
+SPA compiled into the binary — nothing extra to deploy, and it polls the
+same public API you can script against.
+
+Like `/metrics`, the dashboard is unauthenticated and intended for private
+networks.
+
+### Endpoints
+
 | Endpoint | Purpose |
 |----------|---------|
+| `GET /` | Embedded dashboard |
+| `GET /api/stats` | Dashboard's JSON snapshot (uptime, lag, sinks, tables, backfill, DLQ) |
 | `GET /health` | Liveness — process is up |
 | `GET /readiness` | Readiness — live replication stream **and** all sinks healthy |
 | `GET /metrics` | Prometheus metrics |
@@ -418,6 +438,7 @@ internal/
     config/            # Env + sink YAML loading
     resilience/        # Retry + circuit breaker wrapper for sinks
     dlq/               # Dead-letter queue: parking decorator + triage API backend
+ui/                    # Svelte dashboard (built dist/ is committed and embedded)
     server/            # HTTP health/readiness/metrics
     metrics/           # Prometheus collectors
 ```

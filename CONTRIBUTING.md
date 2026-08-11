@@ -41,6 +41,22 @@ docker compose -f docker-compose-local.yml exec redis \
   redis-cli XRANGE cdc:public:t - +
 ```
 
+## Working on the dashboard
+
+The dashboard is a Svelte 5 + Tailwind SPA in `ui/`, embedded into the
+binary PocketBase-style: the built `ui/dist/` is **committed**, so plain
+`go build` needs no Node toolchain.
+
+```bash
+cd ui
+npm ci
+npm run dev     # dev server; proxies /api, /dlq, /backfill to :8080
+npm run build   # rebuild dist/ — commit the result with your change
+```
+
+If you change anything under `ui/src`, rebuild and commit `ui/dist` in the
+same PR.
+
 ## Before you submit
 
 ```bash

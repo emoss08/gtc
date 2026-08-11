@@ -37,3 +37,21 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+
+  ui:
+    name: Build dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install and build
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
