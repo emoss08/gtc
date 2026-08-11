@@ -43,7 +43,8 @@ docker compose -f docker-compose-local.yml exec redis \
 
 ## Working on the dashboard
 
-The dashboard is a Svelte 5 + Tailwind SPA in `ui/`, embedded into the
+The dashboard is a React 19 + TypeScript + Tailwind SPA in `ui/` (shadcn/ui,
+TanStack Table/Query, react-hook-form + zod), embedded into the
 binary PocketBase-style: the built `ui/dist/` is **committed**, so plain
 `go build` needs no Node toolchain.
 

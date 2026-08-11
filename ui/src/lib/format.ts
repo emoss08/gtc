@@ -1,11 +1,11 @@
-export function formatNumber(n) {
+export function formatNumber(n: number | null | undefined): string {
   if (n == null) return '0';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
   return Math.round(n).toLocaleString();
 }
 
-export function formatBytes(n) {
+export function formatBytes(n: number | null | undefined): string {
   if (n == null || n <= 0) return '0 B';
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   let i = 0;
@@ -16,7 +16,7 @@ export function formatBytes(n) {
   return `${n.toFixed(n >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-export function formatDuration(seconds) {
+export function formatDuration(seconds: number | null | undefined): string {
   if (seconds == null || seconds < 0) return '–';
   const s = Math.floor(seconds);
   if (s < 60) return `${s}s`;
@@ -25,13 +25,13 @@ export function formatDuration(seconds) {
   return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
 }
 
-export function formatRate(n) {
+export function formatRate(n: number | null | undefined): string {
   if (n == null || n < 0.05) return '0/s';
   if (n < 10) return `${n.toFixed(1)}/s`;
   return `${formatNumber(n)}/s`;
 }
 
-export function timeAgo(iso) {
+export function timeAgo(iso: string | null | undefined): string {
   if (!iso) return '–';
   const diff = (Date.now() - new Date(iso).getTime()) / 1000;
   if (diff < 60) return `${Math.max(0, Math.floor(diff))}s ago`;

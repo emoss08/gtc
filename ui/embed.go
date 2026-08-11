@@ -1,4 +1,4 @@
-// Package ui embeds the built dashboard (a Svelte SPA in ui/dist) into the
+// Package ui embeds the built dashboard (a React SPA in ui/dist) into the
 // gateway binary, PocketBase-style: the dist directory is committed so plain
 // `go build` works without a Node toolchain. Rebuild it with `npm run build`
 // in this directory.
