@@ -12,6 +12,7 @@ GTC is a PostgreSQL Change Data Capture (CDC) platform written in Go. It capture
 go build -o gateway ./cmd/gateway
 go test ./...
 go run ./cmd/gateway
+go run ./cmd/gateway doctor   # preflight checks (PG settings, privileges, sinks); exit 1 on failure
 
 # End-to-end test (real PostgreSQL wal_level=logical + Redis; also run in CI):
 GTC_TEST_DATABASE_URL=postgres://... GTC_TEST_REDIS_URL=redis://... \

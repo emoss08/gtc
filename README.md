@@ -23,7 +23,9 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
 
 - **Single binary, plug and play** — point it at a database with
   `wal_level=logical`, set a Redis URL, and every table is mirrored. The
-  replication slot and publication are created automatically.
+  replication slot and publication are created automatically, and
+  `gtc doctor` verifies the whole environment (settings, privileges, sinks)
+  before the first run.
 - **Lock-free initial backfill** — on first start, existing table data is
   synced to the sinks *concurrently with live streaming* using watermark
   chunking (the DBLog algorithm): no table locks, no paused replication, and
@@ -136,6 +138,34 @@ enable the other sinks. `gateway --version` prints the build version.
 > dropped. If you stop running GTC permanently, drop its slot
 > (`SELECT pg_drop_replication_slot('cdc_demo_slot');`) or your disk will
 > slowly fill.
+
+### Preflight: `gtc doctor`
+
+Before the first run (or when something is off), let GTC diagnose the
+environment instead of reading startup logs:
+
+```bash
+DATABASE_URL="postgres://...?replication=database" REDIS_URL="redis://..." \
+./gateway doctor
+```
+
+It verifies everything in one pass — `wal_level`, replication privileges
+(including a real `IDENTIFY_SYSTEM` handshake), free replication slots and
+WAL senders, publication/slot existence vs. auto-create permissions, tables
+that would reject UPDATE/DELETE for lack of a replica identity, sink
+reachability (Redis `PING`, RedisJSON module presence, Meilisearch health),
+transform compilation, and whether your sink timeouts fit inside
+`wal_sender_timeout` — then exits 0 if GTC is ready to stream, 1 if
+something needs fixing, with a concrete hint per finding:
+
+```
+PostgreSQL
+  ✓ connection             PostgreSQL 16.13
+  ✗ wal_level              "replica" — logical replication needs wal_level=logical
+                           (ALTER SYSTEM SET wal_level = 'logical'; then restart PostgreSQL)
+  ✓ privileges             user "postgres" is superuser
+  ...
+```
 
 ## Event format
 

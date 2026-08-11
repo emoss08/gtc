@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/joho/godotenv"
 	"go.uber.org/fx"
+
+	"github.com/emoss08/gtc/internal/infrastructure/doctor"
 )
 
 // Overridden at release time via -ldflags "-X main.version=...".
@@ -22,6 +25,12 @@ func main() {
 	}
 
 	_ = godotenv.Load()
+
+	// `gtc doctor` checks prerequisites (PostgreSQL settings, privileges,
+	// sink reachability) and exits instead of starting the pipeline.
+	if len(os.Args) > 1 && os.Args[1] == "doctor" {
+		os.Exit(doctor.Run(context.Background(), os.Stdout))
+	}
 
 	logger := newLogger()
 	logger.Info("starting GTC", slog.String("version", version))

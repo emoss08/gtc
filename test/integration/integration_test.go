@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -96,7 +97,14 @@ func TestEndToEnd(t *testing.T) {
 			i, fmt.Sprintf("seed-%d", i), fmt.Sprintf("seed-%d@example.com", i))
 	}
 
-	gw := startGateway(t, ctx, dbURL, redisURL)
+	bin := buildGateway(t, ctx)
+
+	// Preflight: `gtc doctor` must pass against a correctly provisioned
+	// environment, and fail when a sink is unreachable.
+	runDoctor(t, ctx, bin, dbURL, redisURL, true)
+	runDoctor(t, ctx, bin, dbURL, "redis://127.0.0.1:1/", false)
+
+	gw := startGateway(t, ctx, bin, dbURL, redisURL)
 
 	// Backfill: three READ events, one per pre-existing row.
 	events := awaitEvents(t, ctx, rdb, func(seen []payload) bool {
@@ -168,7 +176,7 @@ type gateway struct {
 	logs    *os.File
 }
 
-func startGateway(t *testing.T, ctx context.Context, dbURL, redisURL string) *gateway {
+func buildGateway(t *testing.T, ctx context.Context) string {
 	t.Helper()
 
 	repoRoot, err := filepath.Abs("../..")
@@ -181,6 +189,37 @@ func startGateway(t *testing.T, ctx context.Context, dbURL, redisURL string) *ga
 	build.Dir = repoRoot
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build gateway: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// runDoctor executes `gateway doctor` and asserts on its exit code.
+func runDoctor(t *testing.T, ctx context.Context, bin, dbURL, redisURL string, wantOK bool) {
+	t.Helper()
+
+	cmd := exec.CommandContext(ctx, bin, "doctor")
+	cmd.Env = append(os.Environ(),
+		"DATABASE_URL="+withReplication(t, dbURL),
+		"REDIS_URL="+redisURL,
+		"CDC_SLOT_NAME="+slotName,
+		"CDC_PUBLICATION_NAME="+publication,
+	)
+	out, err := cmd.CombinedOutput()
+	ok := err == nil
+	if ok != wantOK {
+		t.Fatalf("doctor exit ok=%v, want %v; output:\n%s", ok, wantOK, out)
+	}
+	if wantOK && !strings.Contains(string(out), "Ready to stream.") {
+		t.Fatalf("doctor passed without the ready line:\n%s", out)
+	}
+}
+
+func startGateway(t *testing.T, ctx context.Context, bin, dbURL, redisURL string) *gateway {
+	t.Helper()
+
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	port := freePort(t)
