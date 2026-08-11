@@ -48,6 +48,11 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
   `last4`, `redact`, `null`), column dropping, and CEL row filters,
   configured per sink and per table in YAML. The stream can carry full rows while the search index gets
   masked ones — no plugin code, no SMT classes.
+- **Schema-change awareness** — GTC notices when a published table gains,
+  loses or retypes a column, changes replica identity, or is renamed, and
+  reports it on the dashboard, in `/api/schema`, in Prometheus, and on a
+  Redis notification stream — flagging changes that can break consumers. No
+  DDL triggers, no schema-history topic, no superuser.
 - **First-class transactional outbox** — write domain events to an outbox
   table in the same transaction as your business writes, and GTC publishes
   them to per-topic Redis streams with optional delete-after-publish. Five
@@ -62,8 +67,9 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
   silently dropped.
 - **Embedded live dashboard** — a React dashboard served from the binary at
   `/` (PocketBase-style, no separate deployment): live throughput, WAL lag,
-  sink health and breaker states, per-table activity, backfill progress, and
-  DLQ triage with one-click retry/discard. Light and dark themes.
+  sink health and breaker states, per-table activity, schema-change history,
+  backfill progress, and DLQ triage with one-click retry/discard. Light and
+  dark themes.
 - **Observability** — Prometheus metrics (events, per-sink latency, errors,
   retries, breaker state, WAL lag in bytes), health and readiness endpoints,
   structured JSON logs.
@@ -224,6 +230,7 @@ lives in an optional YAML file.
 | `CDC_DLQ_THRESHOLD` | `3` | Failure cycles for the same event before it is parked |
 | `CDC_DLQ_MAX_ENTRIES` | `10000` | DLQ cap; when full, parking fails and the pipeline stalls |
 | `CDC_MASK_HMAC_KEY` | – | Secret key for the `hmac256` mask strategy (required when a transform uses it) |
+| `CDC_SCHEMA_EVENTS` | `true` | Publish detected DDL changes to the `<prefix>:schema` Redis stream (detection, metrics and `/api/schema` are always on) |
 | `SINK_CONFIG_FILE` | – | Path to the per-table sink YAML (below) |
 | `REDIS_URL` | – | Enables the Redis Stream sink |
 | `REDIS_STREAM_PREFIX` | `cdc` | Stream key prefix |
@@ -349,6 +356,55 @@ Behavior worth knowing:
 - Delivery is at-least-once like everything else; consumers dedupe by the
   `id` field.
 
+## Schema changes (DDL)
+
+PostgreSQL's logical decoding does not stream DDL statements — there is no
+`ALTER TABLE` event to subscribe to. What it *does* do is re-describe a
+published table whenever its shape has changed, immediately before that
+table's next row change. GTC diffs those descriptions and reports the
+**effect** of the DDL:
+
+| Detected | Kind | Breaking? |
+|----------|------|-----------|
+| New column | `column_added` | no — additive |
+| Column removed | `column_dropped` | yes |
+| Column type altered | `column_type_changed` | yes |
+| Primary key / identity index replaced | `key_changed` | yes |
+| `REPLICA IDENTITY` altered | `replica_identity_changed` | yes |
+| Table renamed or moved schema | `table_renamed` | yes |
+
+Every change is counted in `cdc_schema_changes_total{schema,table,kind}`,
+logged (breaking ones at WARN, so existing log alerting picks them up), kept
+in a rolling in-memory history behind `GET /api/schema`, and shown on the
+dashboard's **Schema** page. With `REDIS_URL` set, it is also published to
+the `<REDIS_STREAM_PREFIX>:schema` stream so consumers can react
+programmatically:
+
+```bash
+redis-cli XRANGE cdc:schema - +
+# fields: table, lsn, breaking, payload (full JSON diff)
+```
+
+Set `CDC_SCHEMA_EVENTS=false` to keep detection, metrics and the API while
+skipping the Redis stream.
+
+None of this needs DDL triggers, a schema-history topic, or superuser — it
+falls out of the replication stream you are already reading. Two honest
+limitations follow from that:
+
+- **Detection is tied to the next row change.** A table altered at 02:00 and
+  first written at 09:00 reports its change at 09:00. The LSN on the change
+  is where GTC *detected* it, not where the DDL committed.
+- **Several statements can collapse into one change.** If a column is added
+  and another dropped between two row changes, they arrive as a single
+  combined change — the net effect, not a statement log.
+
+Unlike row events, schema notifications are **best-effort**: a change cannot
+be re-derived on redelivery (a reconnect re-describes the table with nothing
+to diff against), so a failed Redis publish is counted in
+`cdc_schema_publish_errors_total` and logged rather than stalling the
+pipeline. Row delivery keeps its at-least-once guarantee regardless.
+
 ## Backfill and replay
 
 GTC syncs *existing* data, not just new changes. When the replication slot is
@@ -453,6 +509,7 @@ networks.
 |----------|---------|
 | `GET /` | Embedded dashboard |
 | `GET /api/stats` | Dashboard's JSON snapshot (uptime, lag, sinks, tables, backfill, DLQ) |
+| `GET /api/schema` | Recently detected schema (DDL) changes, newest first |
 | `GET /health` | Liveness — process is up |
 | `GET /readiness` | Readiness — live replication stream **and** all sinks healthy |
 | `GET /metrics` | Prometheus metrics |

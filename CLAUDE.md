@@ -59,6 +59,12 @@ Consequences to keep in mind:
   placeholder strings) and listed in `UnchangedToastColumns`. Sinks handle
   this with partial updates (Meilisearch `UpdateDocuments`, RedisJSON
   `JSON.MERGE`).
+- Schema (DDL) changes are detected by diffing pgoutput relation
+  descriptions, which PostgreSQL re-sends before a changed table's next row
+  change. They are **best-effort**, not at-least-once: a reconnect
+  re-describes tables with nothing to diff against, so a missed change cannot
+  be redelivered. Observers must therefore never fail the WAL stream —
+  `ports.SchemaObserver` returns no error by design.
 - Backfill emits `READ` events for existing rows, interleaved with the live
   stream via WAL watermarks (`pg_logical_emit_message`, prefix
   `gtc-backfill`). Chunk rows superseded by live events between the low and
@@ -95,6 +101,7 @@ Consequences to keep in mind:
 | CDC_DLQ_THRESHOLD | 3 | Failure cycles for the same event before it is parked |
 | CDC_DLQ_MAX_ENTRIES | 10000 | DLQ cap; when full, parking fails and the pipeline stalls |
 | CDC_MASK_HMAC_KEY | - | Secret key for the hmac256 mask strategy (startup fails if a transform uses hmac256 without it) |
+| CDC_SCHEMA_EVENTS | true | Publish detected DDL changes to the <prefix>:schema Redis stream (detection/metrics/API always on) |
 | SINK_CONFIG_FILE | - | Path to per-table sink YAML (see config/sinks.example.yaml). Without it, Redis sinks mirror all tables |
 | REDIS_URL | - | Redis connection (enables stream sink if set) |
 | REDIS_STREAM_PREFIX | cdc | Stream key prefix |
@@ -147,6 +154,8 @@ internal/
     transform/         # Declarative per-sink transforms (CEL filters, masking)
     resilience/        # Circuit breaker and retry wrapper for sinks
     dlq/               # Dead-letter queue (Redis store, parking decorator, triage)
+    doctor/            # `gtc doctor` preflight checks
+    schema/            # DDL change history, logging, and Redis notification stream
     server/            # HTTP server: health/readiness/metrics, APIs, dashboard
     metrics/           # Prometheus metrics
 ui/                    # React 19 + Tailwind dashboard; dist/ committed + embedded

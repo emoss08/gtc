@@ -26,6 +26,10 @@ type Config struct {
 	// MaskHMACKey keys the hmac256 mask strategy in sink transforms. Empty
 	// means the strategy is unavailable (configs using it fail at startup).
 	MaskHMACKey string
+	// SchemaEvents publishes detected DDL changes to the Redis stream
+	// "<REDIS_STREAM_PREFIX>:schema". Detection, metrics, logging and the
+	// /api/schema history are always on; this only controls publishing.
+	SchemaEvents bool
 }
 
 type DLQConfig struct {

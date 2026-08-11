@@ -19,6 +19,7 @@ import (
 	"github.com/emoss08/gtc/internal/infrastructure/config"
 	"github.com/emoss08/gtc/internal/infrastructure/dlq"
 	"github.com/emoss08/gtc/internal/infrastructure/resilience"
+	"github.com/emoss08/gtc/internal/infrastructure/schema"
 	"github.com/emoss08/gtc/internal/infrastructure/server"
 	"github.com/emoss08/gtc/internal/infrastructure/transform"
 	"github.com/emoss08/gtc/ui"
@@ -34,6 +35,8 @@ func Module() fx.Option {
 			config.LoadSinksConfig,
 			newBackfillCoordinator,
 			newDLQManager,
+			newSchemaRecorder,
+			newSchemaObserver,
 			newWALReader,
 			func(r *wal.Reader) ports.WALReader { return r },
 			newSinks,
@@ -107,9 +110,46 @@ func newDLQManager(cfg *config.Config, logger *slog.Logger) (*dlq.Manager, error
 	}), nil
 }
 
+// newSchemaRecorder keeps the in-memory DDL history that /api/schema and the
+// dashboard read.
+func newSchemaRecorder(logger *slog.Logger) *schema.Recorder {
+	return schema.NewRecorder(logger)
+}
+
+// newSchemaObserver fans schema changes to the recorder and, when Redis is
+// configured, to the "<prefix>:schema" notification stream.
+func newSchemaObserver(
+	cfg *config.Config,
+	recorder *schema.Recorder,
+	lc fx.Lifecycle,
+	logger *slog.Logger,
+) (ports.SchemaObserver, error) {
+	observers := schema.Observers{recorder}
+
+	if rc := redissink.LoadConfig(); rc.Enabled && cfg.SchemaEvents {
+		publisher, err := schema.NewRedisPublisher(schema.RedisPublisherParams{
+			URL:    rc.URL,
+			Prefix: rc.StreamPrefix,
+			MaxLen: rc.MaxStreamLen,
+			Logger: logger,
+		})
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("publishing schema changes", slog.String("stream", publisher.Stream()))
+		observers = append(observers, publisher)
+		lc.Append(fx.Hook{
+			OnStop: func(context.Context) error { return publisher.Close() },
+		})
+	}
+
+	return observers, nil
+}
+
 func newWALReader(
 	cfg *config.Config,
 	coordinator *backfill.Coordinator,
+	schemaObserver ports.SchemaObserver,
 	logger *slog.Logger,
 ) *wal.Reader {
 	walCfg := wal.Config{
@@ -121,6 +161,7 @@ func newWALReader(
 		AutoCreatePub:     cfg.AutoCreatePub,
 		SlotRetryInterval: cfg.SlotRetryInterval,
 		SlotRetryTimeout:  cfg.SlotRetryTimeout,
+		SchemaObserver:    schemaObserver,
 	}
 
 	if coordinator != nil {
@@ -326,6 +367,7 @@ func newHTTPServer(
 	dlqManager *dlq.Manager,
 	reader *wal.Reader,
 	health *server.HealthStatus,
+	schemaRecorder *schema.Recorder,
 	logger *slog.Logger,
 ) *server.Server {
 	var backfillManager ports.BackfillManager
@@ -343,6 +385,7 @@ func newHTTPServer(
 		Backfill: backfillManager,
 		DLQ:      dlqPort,
 		WAL:      reader,
+		Schema:   schemaRecorder,
 		Info: server.InstanceInfo{
 			Version:     version,
 			SlotName:    cfg.SlotName,

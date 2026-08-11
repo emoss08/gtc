@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo, useState } from 'react';
-import { getDlq, getHistory, getStats } from '@/lib/api';
+import { getDlq, getHistory, getSchemaChanges, getStats } from '@/lib/api';
 
 export const POLL_INTERVAL = 2000;
 
@@ -63,6 +63,15 @@ export function useIsDark(): boolean {
     return () => observer.disconnect();
   }, []);
   return dark;
+}
+
+// DDL is rare; a slower poll keeps the dashboard cheap.
+export function useSchemaChanges() {
+  return useQuery({
+    queryKey: ['schema'],
+    queryFn: getSchemaChanges,
+    refetchInterval: 10000,
+  });
 }
 
 export function useDlq(enabled = true) {

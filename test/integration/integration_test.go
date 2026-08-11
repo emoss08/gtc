@@ -82,7 +82,7 @@ func TestEndToEnd(t *testing.T) {
 		_, _ = db.Exec(context.Background(),
 			"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
 			slotName)
-		_ = rdb.Del(context.Background(), stream).Err()
+		_ = rdb.Del(context.Background(), stream, prefix+":schema").Err()
 	}
 	cleanup()          // leftovers from an aborted previous run
 	t.Cleanup(cleanup) // called after the gateway has been stopped
@@ -154,6 +154,41 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if want := []string{"INSERT", "UPDATE", "DELETE"}; !slices.Equal(ops, want) {
 		t.Fatalf("row 4 operations = %v, want %v (per-key order must hold)", ops, want)
+	}
+
+	// DDL: PostgreSQL re-describes the table before the next row change, and
+	// GTC turns that into a schema-change notification.
+	mustExec(t, ctx, db, fmt.Sprintf("ALTER TABLE %s ADD COLUMN nickname text", table))
+	mustExec(t, ctx, db, fmt.Sprintf("ALTER TABLE %s DROP COLUMN email", table))
+	mustExec(t, ctx, db, fmt.Sprintf(
+		"INSERT INTO %s (id, name, nickname) VALUES (5, 'grace', 'amazing grace')", table))
+
+	ddl := awaitSchemaChange(t, ctx, gw.baseURL, fmt.Sprintf("public.%s", table))
+	if !ddl.Breaking {
+		t.Errorf("dropping a column must be reported as breaking: %+v", ddl)
+	}
+	if !slices.Contains(ddl.Kinds, "column_added") || !slices.Contains(ddl.Kinds, "column_dropped") {
+		t.Errorf("kinds = %v, want both column_added and column_dropped", ddl.Kinds)
+	}
+	if len(ddl.AddedColumns) != 1 || ddl.AddedColumns[0].Name != "nickname" {
+		t.Errorf("added columns = %+v", ddl.AddedColumns)
+	}
+	if ddl.AddedColumns[0].Type != "text" {
+		t.Errorf("added column type = %q, want text", ddl.AddedColumns[0].Type)
+	}
+	if len(ddl.DroppedColumns) != 1 || ddl.DroppedColumns[0].Name != "email" {
+		t.Errorf("dropped columns = %+v", ddl.DroppedColumns)
+	}
+
+	// The same change reaches the schema notification stream. The recorder
+	// behind /api/schema and the Redis publisher are independent observers,
+	// so the API can be ahead of the stream by a few hundred microseconds.
+	last := awaitSchemaStreamEntry(t, ctx, rdb)
+	if got := last["table"]; got != "public."+table {
+		t.Errorf("schema entry table = %v", got)
+	}
+	if got := last["breaking"]; got != "true" {
+		t.Errorf("schema entry breaking = %v, want true", got)
 	}
 
 	// The dashboard's stats endpoint sees the same pipeline.
@@ -343,6 +378,62 @@ func awaitEvents(
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for events; stream has %d entries: %+v",
 				len(events), events)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+type schemaChange struct {
+	Schema         string   `json:"schema"`
+	Table          string   `json:"table"`
+	Kinds          []string `json:"kinds"`
+	Breaking       bool     `json:"breaking"`
+	Summary        string   `json:"summary"`
+	AddedColumns   []column `json:"added_columns"`
+	DroppedColumns []column `json:"dropped_columns"`
+}
+
+type column struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// awaitSchemaStreamEntry polls the schema notification stream until it has an
+// entry, returning the newest one.
+func awaitSchemaStreamEntry(t *testing.T, ctx context.Context, rdb *redis.Client) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		msgs, err := rdb.XRange(ctx, prefix+":schema", "-", "+").Result()
+		if err != nil && err != redis.Nil {
+			t.Fatalf("xrange schema stream: %v", err)
+		}
+		if len(msgs) > 0 {
+			return msgs[len(msgs)-1].Values
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no entries on the schema notification stream")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// awaitSchemaChange polls /api/schema until a change for the table shows up.
+func awaitSchemaChange(t *testing.T, ctx context.Context, baseURL, table string) schemaChange {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		var resp struct {
+			Changes []schemaChange `json:"changes"`
+		}
+		getJSON(t, ctx, baseURL+"/api/schema", &resp)
+		for _, change := range resp.Changes {
+			if change.Schema+"."+change.Table == table {
+				return change
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for a schema change on %s; saw %+v", table, resp.Changes)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

@@ -35,6 +35,9 @@ type Config struct {
 	// Controller, when set, interleaves backfill chunks with the live
 	// stream (see ports.BackfillController).
 	Controller ports.BackfillController
+	// SchemaObserver, when set, is notified of DDL changes detected on
+	// published tables.
+	SchemaObserver ports.SchemaObserver
 	// StreamStarted, when set, is called after replication is (re)established.
 	// slotCreated reports whether this run created the replication slot —
 	// true only on the very first start against a fresh database.
@@ -406,6 +409,15 @@ func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) 
 		if err != nil {
 			r.logger.Error("decode failed", slog.String("error", err.Error()))
 			return fmt.Errorf("decode failed: %w", err)
+		}
+
+		// Schema changes are advisory and never fail the stream: they
+		// cannot be re-derived on redelivery, so a failing observer would
+		// stall replication forever without recovering the notification.
+		if r.config.SchemaObserver != nil {
+			for _, change := range result.SchemaChanges {
+				r.config.SchemaObserver.OnSchemaChange(ctx, change)
+			}
 		}
 
 		for _, event := range result.Events {

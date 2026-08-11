@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/emoss08/gtc/internal/core/ports"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -29,6 +30,12 @@ type Server struct {
 	startedAt  time.Time
 	sampler    *sampler
 	info       InstanceInfo
+	schema     SchemaHistory
+}
+
+// SchemaHistory exposes recently detected DDL changes to the dashboard.
+type SchemaHistory interface {
+	History() []domain.SchemaChange
 }
 
 // InstanceInfo is static build/config context surfaced to the dashboard.
@@ -54,6 +61,7 @@ type ServerParams struct {
 	DLQ      ports.DLQManager      // nil when the DLQ is disabled
 	WAL      WALInfo               // reader state for /api/stats
 	UI       fs.FS                 // embedded dashboard; nil disables it
+	Schema   SchemaHistory         // detected DDL changes; nil disables /api/schema
 	Info     InstanceInfo
 	Logger   *slog.Logger
 }
@@ -77,6 +85,7 @@ func New(p ServerParams) *Server {
 		startedAt: time.Now(),
 		sampler:   newSampler(),
 		info:      p.Info,
+		schema:    p.Schema,
 		httpServer: &http.Server{
 			Addr:         fmt.Sprintf(":%d", p.Config.Port),
 			Handler:      r,
@@ -101,6 +110,7 @@ func (s *Server) registerRoutes() {
 	s.router.Post("/dlq/discard", s.handleDLQDiscard)
 	s.router.Get("/api/stats", s.handleStats)
 	s.router.Get("/api/history", s.handleHistory)
+	s.router.Get("/api/schema", s.handleSchema)
 
 	if s.ui != nil {
 		s.router.Get("/*", s.handleUI())

@@ -23,6 +23,9 @@ type txnState struct {
 	inTxn      bool
 	xid        uint32
 	commitTime time.Time
+	// finalLSN is the transaction's commit position, used to place messages
+	// that PostgreSQL sends without a WAL position of their own.
+	finalLSN pglogrepl.LSN
 }
 
 func NewDecoder() *Decoder {
@@ -34,6 +37,9 @@ func NewDecoder() *Decoder {
 
 type DecodeResult struct {
 	Events []domain.CDCEvent
+	// SchemaChanges are DDL changes detected by diffing this position's
+	// relation descriptions against the previously seen ones.
+	SchemaChanges []domain.SchemaChange
 	// Message is a logical decoding message (pg_logical_emit_message)
 	// found at this stream position; used for backfill watermarks.
 	Message *LogicalMessage
@@ -109,6 +115,7 @@ func (d *Decoder) decodeWALData(walData []byte, lsn pglogrepl.LSN) (*DecodeResul
 		d.txn.inTxn = true
 		d.txn.xid = msg.Xid
 		d.txn.commitTime = msg.CommitTime
+		d.txn.finalLSN = msg.FinalLSN
 
 	case *pglogrepl.CommitMessage:
 		d.txn.inTxn = false
@@ -117,6 +124,14 @@ func (d *Decoder) decodeWALData(walData []byte, lsn pglogrepl.LSN) (*DecodeResul
 		result.AckLSN = msg.TransactionEndLSN
 
 	case *pglogrepl.RelationMessageV2:
+		// PostgreSQL re-sends a relation description whenever a published
+		// table's shape changed, just before the next row change for it.
+		// Diffing against the previous one is how GTC detects DDL.
+		if prev, ok := d.relations[msg.RelationID]; ok {
+			if change := d.diffRelation(prev, msg, lsn); change != nil {
+				result.SchemaChanges = append(result.SchemaChanges, *change)
+			}
+		}
 		d.relations[msg.RelationID] = msg
 
 	case *pglogrepl.InsertMessageV2:
@@ -173,6 +188,134 @@ func (d *Decoder) decodeWALData(walData []byte, lsn pglogrepl.LSN) (*DecodeResul
 	}
 
 	return result, nil
+}
+
+// diffRelation reports what changed between two descriptions of the same
+// table, or nil when they are identical (PostgreSQL re-sends an unchanged
+// relation after a reconnect, and that is not a DDL change).
+func (d *Decoder) diffRelation(
+	prev, cur *pglogrepl.RelationMessageV2,
+	lsn pglogrepl.LSN,
+) *domain.SchemaChange {
+	// PostgreSQL sends relation descriptions without a WAL position of their
+	// own. Fall back to the commit position of the transaction they arrived
+	// in, so the change can still be ordered against row events.
+	if lsn == 0 {
+		lsn = d.txn.finalLSN
+	}
+	change := domain.SchemaChange{
+		Schema:             cur.Namespace,
+		Table:              cur.RelationName,
+		RelationID:         cur.RelationID,
+		KeyColumns:         keyColumns(cur),
+		PreviousKeyColumns: keyColumns(prev),
+		ReplicaIdentity:    string(cur.ReplicaIdentity),
+		LSN:                lsn.String(),
+		TransactionID:      d.txn.xid,
+		Timestamp:          d.txn.commitTime,
+	}
+
+	if prev.Namespace != cur.Namespace || prev.RelationName != cur.RelationName {
+		change.PreviousSchema = prev.Namespace
+		change.PreviousTable = prev.RelationName
+		change.Kinds = append(change.Kinds, domain.SchemaChangeTableRenamed)
+	}
+
+	prevCols := make(map[string]*pglogrepl.RelationMessageColumn, len(prev.Columns))
+	for i := range prev.Columns {
+		prevCols[prev.Columns[i].Name] = prev.Columns[i]
+	}
+	curCols := make(map[string]*pglogrepl.RelationMessageColumn, len(cur.Columns))
+	for i := range cur.Columns {
+		curCols[cur.Columns[i].Name] = cur.Columns[i]
+	}
+
+	// Iterate the relation's own column order so output is deterministic.
+	for i := range cur.Columns {
+		col := cur.Columns[i]
+		before, existed := prevCols[col.Name]
+		if !existed {
+			change.AddedColumns = append(change.AddedColumns, d.columnDef(col))
+			continue
+		}
+		if before.DataType != col.DataType {
+			change.ChangedColumns = append(change.ChangedColumns, domain.ColumnTypeChange{
+				Name: col.Name,
+				From: d.columnDef(before),
+				To:   d.columnDef(col),
+			})
+		}
+	}
+	for i := range prev.Columns {
+		col := prev.Columns[i]
+		if _, stillThere := curCols[col.Name]; !stillThere {
+			change.DroppedColumns = append(change.DroppedColumns, d.columnDef(col))
+		}
+	}
+
+	if len(change.AddedColumns) > 0 {
+		change.Kinds = append(change.Kinds, domain.SchemaChangeColumnAdded)
+	}
+	if len(change.DroppedColumns) > 0 {
+		change.Kinds = append(change.Kinds, domain.SchemaChangeColumnDropped)
+	}
+	if len(change.ChangedColumns) > 0 {
+		change.Kinds = append(change.Kinds, domain.SchemaChangeColumnTypeChanged)
+	}
+	if prev.ReplicaIdentity != cur.ReplicaIdentity {
+		change.PreviousReplicaIdentity = string(prev.ReplicaIdentity)
+		change.Kinds = append(change.Kinds, domain.SchemaChangeReplicaIdentity)
+	} else if !equalStrings(change.PreviousKeyColumns, change.KeyColumns) {
+		// The identity setting is unchanged but its columns are not: the
+		// primary key or the identity index itself was altered.
+		change.Kinds = append(change.Kinds, domain.SchemaChangeKeyChanged)
+	}
+
+	if len(change.Kinds) == 0 {
+		return nil
+	}
+	return &change
+}
+
+func (d *Decoder) columnDef(col *pglogrepl.RelationMessageColumn) domain.ColumnDef {
+	return domain.ColumnDef{
+		Name:      col.Name,
+		Type:      d.typeName(col.DataType),
+		TypeOID:   col.DataType,
+		PartOfKey: col.Flags&1 == 1,
+	}
+}
+
+// typeName resolves a type OID to its PostgreSQL name, falling back to the
+// raw OID for types the client does not know (extensions, user-defined types).
+func (d *Decoder) typeName(oid uint32) string {
+	if dt, ok := d.typeMap.TypeForOID(oid); ok {
+		return dt.Name
+	}
+	return fmt.Sprintf("oid:%d", oid)
+}
+
+// keyColumns returns the columns PostgreSQL marks as the replica identity.
+func keyColumns(rel *pglogrepl.RelationMessageV2) []string {
+	var keys []string
+	for i := range rel.Columns {
+		if rel.Columns[i].Flags&1 == 1 {
+			keys = append(keys, rel.Columns[i].Name)
+		}
+	}
+	return keys
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Decoder) relation(relationID uint32) (*pglogrepl.RelationMessageV2, error) {
