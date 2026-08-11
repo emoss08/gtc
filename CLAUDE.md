@@ -20,6 +20,12 @@ cd ui && npm ci && npm run build
 cd ui && npm run dev
 ```
 
+The codebase is pure Go (CGO_ENABLED=0) and must keep building for
+linux/darwin/windows on amd64/arm64 — CI cross-compiles all six targets and
+runs the test suite on Linux, Windows, and macOS. Releases are cut by
+pushing a `v*` tag (goreleaser builds the binaries; a multi-arch Docker
+image goes to ghcr.io).
+
 ## Delivery Semantics
 
 GTC provides **at-least-once** delivery. The WAL position is only confirmed to

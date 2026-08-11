@@ -1,4 +1,6 @@
-FROM golang:1.25.3-alpine AS builder
+# Multi-arch build: docker buildx sets BUILDPLATFORM/TARGETOS/TARGETARCH so
+# the (fast, native) builder cross-compiles for the requested target.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 
 WORKDIR /app
 
@@ -9,7 +11,11 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /gateway ./cmd/gateway
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-s -w -X main.version=${VERSION}" -o /gateway ./cmd/gateway
 
 FROM alpine:3.21
 
