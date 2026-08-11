@@ -121,7 +121,7 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 			return nil
 		}
 
-		task, err := index.DeleteDocumentWithContext(ctx, fmt.Sprintf("%v", id))
+		task, err := index.DeleteDocumentWithContext(ctx, fmt.Sprintf("%v", id), nil)
 		if err != nil {
 			s.logger.Error("failed to delete document",
 				slog.String("error", err.Error()),
@@ -141,7 +141,7 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 		)
 
 	case domain.OperationTruncate:
-		task, err := index.DeleteAllDocumentsWithContext(ctx)
+		task, err := index.DeleteAllDocumentsWithContext(ctx, nil)
 		if err != nil {
 			s.logger.Error("failed to delete all documents",
 				slog.String("error", err.Error()),
