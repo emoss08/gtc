@@ -1,0 +1,55 @@
+version: 2
+
+project_name: gtc
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: gtc
+    main: ./cmd/gateway
+    binary: gtc
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: gtc
+    formats: ["tar.gz"]
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+      - config/sinks.example.yaml
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - "^docs"
+      - "^chore"
+      - "^test"
+
+release:
+  footer: |
+    ## Docker
+
+    ```
+    docker pull ghcr.io/emoss08/gtc:{{ .Version }}
+    ```

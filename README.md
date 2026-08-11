@@ -94,6 +94,11 @@ docker compose -f docker-compose-local.yml exec redis \
 
 ### Binary
 
+GTC is a single, pure-Go binary and runs natively on **Linux, macOS, and
+Windows** (amd64 and arm64). Grab a prebuilt binary from the
+[releases page](https://github.com/emoss08/gtc/releases), pull the multi-arch
+Docker image (`ghcr.io/emoss08/gtc`), or build from source:
+
 ```bash
 go build -o gateway ./cmd/gateway
 
@@ -102,9 +107,19 @@ REDIS_URL="redis://localhost:6379" \
 ./gateway
 ```
 
+On Windows (PowerShell):
+
+```powershell
+go build -o gateway.exe ./cmd/gateway
+
+$env:DATABASE_URL = "postgres://postgres:postgres@localhost:5432/mydb?replication=database"
+$env:REDIS_URL = "redis://localhost:6379"
+.\gateway.exe
+```
+
 That's the whole setup: with no further configuration GTC mirrors every table
 in the publication to Redis. Add `REDIS_JSON_URL` and/or `MEILISEARCH_URL` to
-enable the other sinks.
+enable the other sinks. `gateway --version` prints the build version.
 
 ### PostgreSQL requirements
 

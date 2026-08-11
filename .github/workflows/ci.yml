@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Build, vet, and test
+  lint:
+    name: Format, vet, and race tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,21 +22,57 @@ jobs:
 
       - name: Check formatting
         run: |
-          unformatted=$(gofmt -l ./cmd ./internal)
+          unformatted=$(gofmt -l ./cmd ./internal ./ui)
           if [ -n "$unformatted" ]; then
             echo "The following files are not gofmt-formatted:"
             echo "$unformatted"
             exit 1
           fi
 
-      - name: Build
-        run: go build ./...
-
       - name: Vet
         run: go vet ./...
 
-      - name: Test
+      - name: Test (race)
         run: go test -race ./...
+
+  test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./...
+
+  cross-compile:
+    name: Cross-compile all targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build every OS/arch
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "building $target"
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null ./cmd/gateway
+          done
 
   ui:
     name: Build dashboard

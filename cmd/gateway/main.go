@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -9,11 +10,24 @@ import (
 	"go.uber.org/fx"
 )
 
+// Overridden at release time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" || arg == "-v" {
+			fmt.Printf("gtc %s\n", version)
+			return
+		}
+	}
+
 	_ = godotenv.Load()
 
+	logger := newLogger()
+	logger.Info("starting GTC", slog.String("version", version))
+
 	fx.New(
-		fx.Provide(newLogger),
+		fx.Provide(func() *slog.Logger { return logger }),
 		Module(),
 	).Run()
 }
