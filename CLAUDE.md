@@ -12,6 +12,12 @@ GTC is a PostgreSQL Change Data Capture (CDC) platform written in Go. It capture
 go build -o gateway ./cmd/gateway
 go test ./...
 go run ./cmd/gateway
+
+# Dashboard (ui/): the built dist/ is committed and embedded via go:embed,
+# so plain `go build` works without Node. After changing ui/src, rebuild:
+cd ui && npm ci && npm run build
+# Dev server with API proxied to a running gateway on :8080:
+cd ui && npm run dev
 ```
 
 ## Delivery Semantics
@@ -128,8 +134,9 @@ internal/
     transform/         # Declarative per-sink transforms (CEL filters, masking)
     resilience/        # Circuit breaker and retry wrapper for sinks
     dlq/               # Dead-letter queue (Redis store, parking decorator, triage)
-    server/            # HTTP health/readiness/metrics server
+    server/            # HTTP server: health/readiness/metrics, APIs, dashboard
     metrics/           # Prometheus metrics
+ui/                    # Svelte 5 + Tailwind dashboard; dist/ committed + embedded
 ```
 
 ## Adding New Sinks

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -23,6 +24,9 @@ type Server struct {
 	checker    HealthChecker
 	backfill   ports.BackfillManager
 	dlq        ports.DLQManager
+	wal        WALInfo
+	ui         fs.FS
+	startedAt  time.Time
 }
 
 type HealthChecker interface {
@@ -39,6 +43,8 @@ type ServerParams struct {
 	Checker  HealthChecker
 	Backfill ports.BackfillManager // nil when backfill is disabled
 	DLQ      ports.DLQManager      // nil when the DLQ is disabled
+	WAL      WALInfo               // reader state for /api/stats
+	UI       fs.FS                 // embedded dashboard; nil disables it
 	Logger   *slog.Logger
 }
 
@@ -51,11 +57,14 @@ func New(p ServerParams) *Server {
 	r.Use(middleware.Timeout(30 * time.Second))
 
 	s := &Server{
-		router:   r,
-		logger:   p.Logger.With(slog.String("component", "http_server")),
-		checker:  p.Checker,
-		backfill: p.Backfill,
-		dlq:      p.DLQ,
+		router:    r,
+		logger:    p.Logger.With(slog.String("component", "http_server")),
+		checker:   p.Checker,
+		backfill:  p.Backfill,
+		dlq:       p.DLQ,
+		wal:       p.WAL,
+		ui:        p.UI,
+		startedAt: time.Now(),
 		httpServer: &http.Server{
 			Addr:         fmt.Sprintf(":%d", p.Config.Port),
 			Handler:      r,
@@ -78,6 +87,30 @@ func (s *Server) registerRoutes() {
 	s.router.Get("/dlq", s.handleDLQList)
 	s.router.Post("/dlq/retry", s.handleDLQRetry)
 	s.router.Post("/dlq/discard", s.handleDLQDiscard)
+	s.router.Get("/api/stats", s.handleStats)
+
+	if s.ui != nil {
+		s.router.Get("/*", s.handleUI())
+	}
+}
+
+// handleUI serves the embedded dashboard with an index.html fallback for
+// client-side routes (chi gives static routes priority over the wildcard,
+// so the API endpoints above are unaffected).
+func (s *Server) handleUI() http.HandlerFunc {
+	fileServer := http.FileServer(http.FS(s.ui))
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path != "" {
+			if f, err := s.ui.Open(path); err == nil {
+				_ = f.Close()
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+		}
+		r.URL.Path = "/"
+		fileServer.ServeHTTP(w, r)
+	}
 }
 
 // Entry IDs contain characters that are awkward in URL paths (the LSN in

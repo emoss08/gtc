@@ -21,6 +21,7 @@ import (
 	"github.com/emoss08/gtc/internal/infrastructure/resilience"
 	"github.com/emoss08/gtc/internal/infrastructure/server"
 	"github.com/emoss08/gtc/internal/infrastructure/transform"
+	"github.com/emoss08/gtc/ui"
 	"go.uber.org/fx"
 )
 
@@ -322,6 +323,7 @@ func newHTTPServer(
 	cfg *config.Config,
 	coordinator *backfill.Coordinator,
 	dlqManager *dlq.Manager,
+	reader *wal.Reader,
 	health *server.HealthStatus,
 	logger *slog.Logger,
 ) *server.Server {
@@ -333,13 +335,21 @@ func newHTTPServer(
 	if dlqManager != nil {
 		dlqPort = dlqManager
 	}
-	return server.New(server.ServerParams{
+
+	params := server.ServerParams{
 		Config:   server.Config{Port: cfg.HTTPPort},
 		Checker:  health,
 		Backfill: backfillManager,
 		DLQ:      dlqPort,
+		WAL:      reader,
 		Logger:   logger,
-	})
+	}
+	if dist, ok := ui.DistFS(); ok {
+		params.UI = dist
+	} else {
+		logger.Warn("dashboard assets not embedded; UI disabled (build with: cd ui && npm run build)")
+	}
+	return server.New(params)
 }
 
 func run(
