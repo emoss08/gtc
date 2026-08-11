@@ -66,6 +66,20 @@ go vet ./...
 go test ./...
 ```
 
+There is also an end-to-end test that runs the compiled gateway against a
+real PostgreSQL and Redis (CI runs it on every PR). To run it locally you
+need PostgreSQL with `wal_level=logical` and a Redis, e.g.:
+
+```bash
+docker run -d --name pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres \
+  postgres:16 -c wal_level=logical
+docker run -d --name redis -p 6379:6379 redis:7
+
+GTC_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
+GTC_TEST_REDIS_URL=redis://localhost:6379 \
+go test -tags integration -v -timeout 5m ./test/integration
+```
+
 - Follow the [Uber Go Style Guide](https://github.com/uber-go/guide/blob/master/style.md).
 - Add or update tests for behavior you change. Correctness-critical areas
   (the pgoutput decoder, LSN acknowledgment, TOAST handling, key templates)
