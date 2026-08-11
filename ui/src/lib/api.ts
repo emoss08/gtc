@@ -11,6 +11,10 @@ export const sinkStatsSchema = z.object({
   failed: z.number(),
   filtered: z.number(),
   retries: z.number(),
+  errors_by_type: z
+    .record(z.string(), z.number())
+    .nullable()
+    .transform((v) => v ?? {}),
 });
 
 export const tableStatsSchema = z.object({
@@ -35,16 +39,44 @@ export const backfillStatusSchema = z.object({
 
 export const statsSchema = z.object({
   uptime_seconds: z.number(),
+  version: z.string().default('dev'),
+  slot_name: z.string().default(''),
+  publication: z.string().default(''),
   ready: z.boolean(),
   streaming: z.boolean(),
   current_lsn: z.string(),
   wal_lag_bytes: z.number(),
   inflight: z.number(),
   events_total: z.number(),
+  operations: z
+    .record(z.string(), z.number())
+    .nullable()
+    .transform((v) => v ?? {}),
   sinks: z.array(sinkStatsSchema),
   tables: z.array(tableStatsSchema),
   backfill: z.array(backfillStatusSchema),
-  dlq: z.object({ enabled: z.boolean(), entries: z.number() }),
+  dlq: z.object({
+    enabled: z.boolean(),
+    entries: z.number(),
+    parked_total: z.number().default(0),
+    retried_total: z.number().default(0),
+  }),
+});
+
+export const historySchema = z.object({
+  interval_seconds: z.number(),
+  samples: z
+    .array(
+      z.object({
+        t: z.number(),
+        events_total: z.number(),
+        wal_lag_bytes: z.number(),
+        inflight: z.number(),
+        dlq_entries: z.number(),
+      }),
+    )
+    .nullable()
+    .transform((v) => v ?? []),
 });
 
 export const dlqEntrySchema = z.object({
@@ -66,6 +98,8 @@ export const dlqListSchema = z.object({
 });
 
 export type Stats = z.infer<typeof statsSchema>;
+export type History = z.infer<typeof historySchema>;
+export type HistorySample = History['samples'][number];
 export type SinkStats = z.infer<typeof sinkStatsSchema>;
 export type TableStats = z.infer<typeof tableStatsSchema>;
 export type BackfillStatus = z.infer<typeof backfillStatusSchema>;
@@ -85,6 +119,9 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
 }
 
 export const getStats = async (): Promise<Stats> => statsSchema.parse(await request('/api/stats'));
+
+export const getHistory = async (): Promise<History> =>
+  historySchema.parse(await request('/api/history'));
 
 export const getDlq = async (limit = 100): Promise<DlqList> =>
   dlqListSchema.parse(await request(`/dlq?limit=${limit}`));

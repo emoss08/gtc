@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react';
 import { useTable, type ColumnDef } from '@tanstack/react-table';
 import { Search, Table2 } from 'lucide-react';
-import { Card, CardContent } from '@/components/ui/card';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
+import { OpLegend, TableActivityBars } from '@/components/charts';
 import { DataTable } from '@/components/data-table';
 import { features } from '@/lib/table';
 import { formatNumber } from '@/lib/format';
@@ -87,6 +88,23 @@ export function TablesPage({ stats }: { stats: Stats | undefined }) {
 
   return (
     <div className="space-y-4">
+      {data.length > 0 && (
+        <Card className="gap-2">
+          <CardHeader>
+            <div>
+              <CardTitle>Busiest tables</CardTitle>
+              <CardDescription className="mt-1">
+                Top {Math.min(8, data.length)} tables by change volume, stacked by operation
+              </CardDescription>
+            </div>
+            <OpLegend />
+          </CardHeader>
+          <CardContent className="pr-2">
+            <TableActivityBars tables={data} />
+          </CardContent>
+        </Card>
+      )}
+
       <div className="relative max-w-xs">
         <Search className="text-muted-foreground absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
         <Input

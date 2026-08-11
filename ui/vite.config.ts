@@ -16,5 +16,18 @@ export default defineConfig({
     alias: { '@': path.resolve(__dirname, './src') },
   },
   server: { proxy },
-  build: { outDir: 'dist', emptyOutDir: true },
+  build: {
+    outDir: 'dist',
+    emptyOutDir: true,
+    chunkSizeWarningLimit: 900,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ['react', 'react-dom'],
+          charts: ['recharts', '@nivo/core', '@nivo/pie', '@nivo/bar'],
+          data: ['@tanstack/react-table', '@tanstack/react-query', 'react-hook-form', 'zod'],
+        },
+      },
+    },
+  },
 });

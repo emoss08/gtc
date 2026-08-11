@@ -1,14 +1,14 @@
 import { useMemo } from 'react';
 import { useTable, type ColumnDef } from '@tanstack/react-table';
-import { Activity, ArrowDownUp, CircleCheck, CircleX, Gauge, Inbox, Layers } from 'lucide-react';
+import { Activity, ArrowDownUp, CircleX, Gauge, Inbox, Layers } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { AreaSpark } from '@/components/spark';
+import { LagChart, OperationDonut, OpLegend, ThroughputChart } from '@/components/charts';
 import { DataTable } from '@/components/data-table';
 import { StatCard } from '@/components/stat-card';
 import { features } from '@/lib/table';
-import { formatBytes, formatNumber, formatRate } from '@/lib/format';
-import { useThroughput } from '@/lib/hooks';
+import { formatBytes, formatDuration, formatNumber, formatRate } from '@/lib/format';
+import { useHistory } from '@/lib/hooks';
 import type { SinkStats, Stats } from '@/lib/api';
 
 const BREAKER: Record<number, { label: string; variant: 'success' | 'warning' | 'destructive' }> = {
@@ -16,6 +16,13 @@ const BREAKER: Record<number, { label: string; variant: 'success' | 'warning' | 
   1: { label: 'half-open', variant: 'warning' },
   2: { label: 'open', variant: 'destructive' },
 };
+
+function errorSummary(errors: Record<string, number>): string {
+  const parts = Object.entries(errors)
+    .sort((a, b) => b[1] - a[1])
+    .map(([type, n]) => `${type}: ${formatNumber(n)}`);
+  return parts.length > 0 ? `errors — ${parts.join(', ')}` : '';
+}
 
 const sinkColumns: Array<ColumnDef<typeof features, SinkStats>> = [
   {
@@ -58,11 +65,12 @@ const sinkColumns: Array<ColumnDef<typeof features, SinkStats>> = [
     accessorKey: 'failed',
     header: () => <span className="block text-right">Failed</span>,
     sortFn: 'basic',
-    cell: ({ getValue }) => {
+    cell: ({ row, getValue }) => {
       const v = getValue<number>();
       return (
         <span
           className={`block text-right tabular-nums ${v > 0 ? 'text-destructive' : 'text-muted-foreground'}`}
+          title={errorSummary(row.original.errors_by_type)}
         >
           {formatNumber(v)}
         </span>
@@ -91,9 +99,19 @@ const sinkColumns: Array<ColumnDef<typeof features, SinkStats>> = [
   },
 ];
 
+function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-3 text-xs">
+      <span className="text-muted-foreground shrink-0">{label}</span>
+      <span className="truncate text-right font-medium">{value}</span>
+    </div>
+  );
+}
+
 export function OverviewPage({ stats }: { stats: Stats | undefined }) {
-  const { rate, history } = useThroughput(stats);
+  const { points } = useHistory();
   const sinks = useMemo(() => stats?.sinks ?? [], [stats]);
+  const currentRate = points.length > 0 ? points[points.length - 1].rate : 0;
 
   const table = useTable({
     features,
@@ -108,17 +126,10 @@ export function OverviewPage({ stats }: { stats: Stats | undefined }) {
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="Throughput"
-          value={formatRate(rate)}
-          sub={`${formatNumber(stats?.events_total)} total`}
+          value={formatRate(currentRate)}
+          sub={`${formatNumber(stats?.events_total)} events total`}
           icon={Activity}
-        >
-          <AreaSpark
-            points={history}
-            width={96}
-            height={46}
-            className="mt-1 shrink-0 text-emerald-500 dark:text-emerald-400"
-          />
-        </StatCard>
+        />
         <StatCard
           label="WAL lag"
           value={formatBytes(stats?.wal_lag_bytes)}
@@ -136,9 +147,7 @@ export function OverviewPage({ stats }: { stats: Stats | undefined }) {
           value={String(dlqCount)}
           sub={
             stats?.dlq.enabled
-              ? dlqCount > 0
-                ? 'needs triage'
-                : 'queue empty'
+              ? `${formatNumber(stats.dlq.parked_total)} parked · ${formatNumber(stats.dlq.retried_total)} retried all-time`
               : 'DLQ disabled'
           }
           icon={Inbox}
@@ -146,12 +155,104 @@ export function OverviewPage({ stats }: { stats: Stats | undefined }) {
         />
       </div>
 
+      <div className="grid gap-4 xl:grid-cols-3">
+        <Card className="gap-2 xl:col-span-2">
+          <CardHeader>
+            <div>
+              <CardTitle>Throughput</CardTitle>
+              <CardDescription className="mt-1">
+                Events per second · last 30 minutes
+              </CardDescription>
+            </div>
+          </CardHeader>
+          <CardContent className="pr-2">
+            <ThroughputChart points={points} />
+          </CardContent>
+        </Card>
+
+        <Card className="gap-2">
+          <CardHeader>
+            <div>
+              <CardTitle>Operation mix</CardTitle>
+              <CardDescription className="mt-1">All events since start</CardDescription>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <OperationDonut operations={stats?.operations ?? {}} />
+            <div className="mt-2 flex justify-center">
+              <OpLegend />
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-3">
+        <Card className="gap-2 xl:col-span-2">
+          <CardHeader>
+            <div>
+              <CardTitle>Replication lag</CardTitle>
+              <CardDescription className="mt-1">
+                WAL bytes between the server and the last confirmed position — sustained growth
+                means a sink can't keep up
+              </CardDescription>
+            </div>
+          </CardHeader>
+          <CardContent className="pr-2">
+            <LagChart points={points} />
+          </CardContent>
+        </Card>
+
+        <Card className="gap-2">
+          <CardHeader>
+            <CardTitle>Instance</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2.5">
+            <InfoRow label="Version" value={stats?.version ?? '–'} />
+            <InfoRow
+              label="Status"
+              value={
+                <span className="flex items-center justify-end gap-1.5">
+                  <Badge variant={stats?.streaming ? 'success' : 'destructive'}>
+                    {stats?.streaming ? 'streaming' : 'disconnected'}
+                  </Badge>
+                  <Badge variant={stats?.ready ? 'success' : 'warning'}>
+                    {stats?.ready ? 'ready' : 'not ready'}
+                  </Badge>
+                </span>
+              }
+            />
+            <InfoRow label="Uptime" value={formatDuration(stats?.uptime_seconds)} />
+            <InfoRow
+              label="Current LSN"
+              value={<span className="font-mono text-[11px]">{stats?.current_lsn ?? '–'}</span>}
+            />
+            <InfoRow
+              label="Slot"
+              value={<span className="font-mono text-[11px]">{stats?.slot_name || '–'}</span>}
+            />
+            <InfoRow
+              label="Publication"
+              value={<span className="font-mono text-[11px]">{stats?.publication || '–'}</span>}
+            />
+            <InfoRow
+              label="Tables observed"
+              value={String(stats?.tables.length ?? 0)}
+            />
+            <InfoRow
+              label="Dead-letter queue"
+              value={stats?.dlq.enabled ? `${dlqCount} parked` : 'disabled'}
+            />
+          </CardContent>
+        </Card>
+      </div>
+
       <Card className="gap-3">
         <CardHeader>
           <div>
             <CardTitle>Sinks</CardTitle>
             <CardDescription className="mt-1">
-              Delivery state per destination — the circuit breaker opens while a sink is down.
+              Delivery state per destination — the circuit breaker opens while a sink is down. Hover
+              a failure count for the error breakdown.
             </CardDescription>
           </div>
           <Badge variant="outline" className="text-muted-foreground">
@@ -171,17 +272,6 @@ export function OverviewPage({ stats }: { stats: Stats | undefined }) {
           />
         </CardContent>
       </Card>
-
-      {stats && (
-        <div className="text-muted-foreground flex flex-wrap items-center gap-x-4 gap-y-1 px-1 text-xs">
-          <span className="flex items-center gap-1">
-            <CircleCheck className="size-3.5" />
-            at-least-once delivery
-          </span>
-          <span>LSN {stats.current_lsn}</span>
-          <span>refreshes every 2s</span>
-        </div>
-      )}
     </div>
   );
 }

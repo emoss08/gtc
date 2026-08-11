@@ -342,7 +342,12 @@ func newHTTPServer(
 		Backfill: backfillManager,
 		DLQ:      dlqPort,
 		WAL:      reader,
-		Logger:   logger,
+		Info: server.InstanceInfo{
+			Version:     version,
+			SlotName:    cfg.SlotName,
+			Publication: cfg.PublicationName,
+		},
+		Logger: logger,
 	}
 	if dist, ok := ui.DistFS(); ok {
 		params.UI = dist

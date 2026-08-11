@@ -18,13 +18,14 @@ type WALInfo interface {
 }
 
 type sinkStats struct {
-	Name         string  `json:"name"`
-	Healthy      bool    `json:"healthy"`
-	BreakerState float64 `json:"breaker_state"` // 0 closed, 1 half-open, 2 open
-	Succeeded    float64 `json:"succeeded"`
-	Failed       float64 `json:"failed"`
-	Filtered     float64 `json:"filtered"`
-	Retries      float64 `json:"retries"`
+	Name         string             `json:"name"`
+	Healthy      bool               `json:"healthy"`
+	BreakerState float64            `json:"breaker_state"` // 0 closed, 1 half-open, 2 open
+	Succeeded    float64            `json:"succeeded"`
+	Failed       float64            `json:"failed"`
+	Filtered     float64            `json:"filtered"`
+	Retries      float64            `json:"retries"`
+	ErrorsByType map[string]float64 `json:"errors_by_type"`
 }
 
 type tableStats struct {
@@ -39,12 +40,16 @@ type tableStats struct {
 
 type statsResponse struct {
 	UptimeSeconds float64                      `json:"uptime_seconds"`
+	Version       string                       `json:"version"`
+	SlotName      string                       `json:"slot_name"`
+	Publication   string                       `json:"publication"`
 	Ready         bool                         `json:"ready"`
 	Streaming     bool                         `json:"streaming"`
 	CurrentLSN    string                       `json:"current_lsn"`
 	WALLagBytes   float64                      `json:"wal_lag_bytes"`
 	Inflight      float64                      `json:"inflight"`
 	EventsTotal   float64                      `json:"events_total"`
+	Operations    map[string]float64           `json:"operations"`
 	Sinks         []sinkStats                  `json:"sinks"`
 	Tables        []tableStats                 `json:"tables"`
 	Backfill      []domain.BackfillTableStatus `json:"backfill"`
@@ -52,8 +57,10 @@ type statsResponse struct {
 }
 
 type dlqStats struct {
-	Enabled bool  `json:"enabled"`
-	Entries int64 `json:"entries"`
+	Enabled      bool    `json:"enabled"`
+	Entries      int64   `json:"entries"`
+	ParkedTotal  float64 `json:"parked_total"`
+	RetriedTotal float64 `json:"retried_total"`
 }
 
 // handleStats shapes live state (reader, health, backfill, DLQ) plus the
@@ -63,6 +70,10 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	resp := statsResponse{
 		UptimeSeconds: time.Since(s.startedAt).Seconds(),
+		Version:       s.info.Version,
+		SlotName:      s.info.SlotName,
+		Publication:   s.info.Publication,
+		Operations:    map[string]float64{},
 		Sinks:         []sinkStats{},
 		Tables:        []tableStats{},
 		Backfill:      []domain.BackfillTableStatus{},
@@ -123,7 +134,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 					}
 					v := metricValue(m)
 					ts.Total += v
-					switch labels["operation"] {
+					op := labels["operation"]
+					resp.Operations[op] += v
+					switch op {
 					case "INSERT":
 						ts.Insert += v
 					case "UPDATE":
@@ -158,6 +171,23 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			case "cdc_circuit_breaker_state":
 				for _, m := range fam.GetMetric() {
 					sink(labelMap(m)["sink"]).BreakerState = metricValue(m)
+				}
+			case "cdc_sink_errors_total":
+				for _, m := range fam.GetMetric() {
+					labels := labelMap(m)
+					st := sink(labels["sink"])
+					if st.ErrorsByType == nil {
+						st.ErrorsByType = map[string]float64{}
+					}
+					st.ErrorsByType[labels["error_type"]] += metricValue(m)
+				}
+			case "cdc_dlq_parked_total":
+				for _, m := range fam.GetMetric() {
+					resp.DLQ.ParkedTotal += metricValue(m)
+				}
+			case "cdc_dlq_retried_total":
+				for _, m := range fam.GetMetric() {
+					resp.DLQ.RetriedTotal += metricValue(m)
 				}
 			}
 		}
