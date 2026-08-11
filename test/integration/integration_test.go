@@ -1,0 +1,385 @@
+//go:build integration
+
+// Package integration runs the compiled gateway against a real PostgreSQL
+// (wal_level=logical) and Redis, and asserts that rows written to the source
+// database arrive on the Redis stream sink: backfilled READ events for
+// pre-existing rows, then INSERT/UPDATE/DELETE from live replication.
+//
+// It is excluded from `go test ./...` by the build tag. Run it with:
+//
+//	GTC_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
+//	GTC_TEST_REDIS_URL=redis://localhost:6379 \
+//	go test -tags integration -v -timeout 5m ./test/integration
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/redis/go-redis/v9"
+)
+
+const (
+	slotName    = "gtc_it_slot"
+	publication = "gtc_it_publication"
+	prefix      = "gtcit"
+	table       = "gtc_it_users"
+	stateTable  = "gtc_it_backfill_state"
+	stream      = prefix + ":public:" + table
+)
+
+type payload struct {
+	Operation string         `json:"operation"`
+	NewData   map[string]any `json:"new_data"`
+	OldData   map[string]any `json:"old_data"`
+}
+
+func TestEndToEnd(t *testing.T) {
+	dbURL := os.Getenv("GTC_TEST_DATABASE_URL")
+	redisURL := os.Getenv("GTC_TEST_REDIS_URL")
+	if dbURL == "" || redisURL == "" {
+		t.Skip("set GTC_TEST_DATABASE_URL and GTC_TEST_REDIS_URL to run integration tests")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	db, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect postgres: %v", err)
+	}
+	defer db.Close(context.Background())
+
+	ropts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		t.Fatalf("parse redis url: %v", err)
+	}
+	rdb := redis.NewClient(ropts)
+	defer rdb.Close()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Fatalf("connect redis: %v", err)
+	}
+
+	cleanup := func() {
+		_, _ = db.Exec(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+		// The backfill resume state must not leak between runs, or the
+		// second run would consider the table already backfilled.
+		_, _ = db.Exec(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", stateTable))
+		_, _ = db.Exec(context.Background(), fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", publication))
+		_, _ = db.Exec(context.Background(),
+			"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
+			slotName)
+		_ = rdb.Del(context.Background(), stream).Err()
+	}
+	cleanup()          // leftovers from an aborted previous run
+	t.Cleanup(cleanup) // called after the gateway has been stopped
+
+	// Rows that exist before the gateway ever starts: the slot does not
+	// exist yet, so auto backfill must emit READ events for them.
+	mustExec(t, ctx, db, fmt.Sprintf(
+		"CREATE TABLE %s (id int PRIMARY KEY, name text, email text)", table))
+	for i := 1; i <= 3; i++ {
+		mustExec(t, ctx, db, fmt.Sprintf(
+			"INSERT INTO %s (id, name, email) VALUES ($1, $2, $3)", table),
+			i, fmt.Sprintf("seed-%d", i), fmt.Sprintf("seed-%d@example.com", i))
+	}
+
+	gw := startGateway(t, ctx, dbURL, redisURL)
+
+	// Backfill: three READ events, one per pre-existing row.
+	events := awaitEvents(t, ctx, rdb, func(seen []payload) bool {
+		return len(distinctIDs(seen, "READ")) >= 3
+	})
+	reads := distinctIDs(events, "READ")
+	for i := 1; i <= 3; i++ {
+		if _, ok := reads[fmt.Sprint(i)]; !ok {
+			t.Fatalf("backfill missing READ for id=%d; got %v", i, reads)
+		}
+	}
+
+	// Live stream: INSERT, UPDATE, DELETE on one row, in order.
+	mustExec(t, ctx, db, fmt.Sprintf(
+		"INSERT INTO %s (id, name, email) VALUES (4, 'ada', 'ada@example.com')", table))
+	mustExec(t, ctx, db, fmt.Sprintf(
+		"UPDATE %s SET email = 'ada@lovelace.dev' WHERE id = 4", table))
+	mustExec(t, ctx, db, fmt.Sprintf("DELETE FROM %s WHERE id = 4", table))
+
+	events = awaitEvents(t, ctx, rdb, func(seen []payload) bool {
+		return rowEventCount(seen, "4") >= 3
+	})
+
+	var ops []string
+	for _, e := range events {
+		if eventRowID(e) != "4" {
+			continue
+		}
+		// At-least-once delivery: collapse duplicates of the same operation.
+		if len(ops) == 0 || ops[len(ops)-1] != e.Operation {
+			ops = append(ops, e.Operation)
+		}
+		switch e.Operation {
+		case "INSERT":
+			if e.NewData["email"] != "ada@example.com" {
+				t.Errorf("INSERT new_data wrong: %v", e.NewData)
+			}
+		case "UPDATE":
+			if e.NewData["email"] != "ada@lovelace.dev" {
+				t.Errorf("UPDATE new_data wrong: %v", e.NewData)
+			}
+		case "DELETE":
+			if e.NewData != nil {
+				t.Errorf("DELETE must not carry new_data: %v", e.NewData)
+			}
+		}
+	}
+	if want := []string{"INSERT", "UPDATE", "DELETE"}; !slices.Equal(ops, want) {
+		t.Fatalf("row 4 operations = %v, want %v (per-key order must hold)", ops, want)
+	}
+
+	// The dashboard's stats endpoint sees the same pipeline.
+	var stats struct {
+		Streaming   bool    `json:"streaming"`
+		EventsTotal float64 `json:"events_total"`
+	}
+	getJSON(t, ctx, gw.baseURL+"/api/stats", &stats)
+	if !stats.Streaming || stats.EventsTotal < 3 {
+		t.Errorf("stats disagree with the stream: %+v", stats)
+	}
+
+	gw.stop(t)
+}
+
+// gateway is the compiled binary under test, running as a subprocess.
+type gateway struct {
+	cmd     *exec.Cmd
+	baseURL string
+	logs    *os.File
+}
+
+func startGateway(t *testing.T, ctx context.Context, dbURL, redisURL string) *gateway {
+	t.Helper()
+
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bin := filepath.Join(t.TempDir(), "gateway")
+	build := exec.CommandContext(ctx, "go", "build", "-o", bin, "./cmd/gateway")
+	build.Dir = repoRoot
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build gateway: %v\n%s", err, out)
+	}
+
+	port := freePort(t)
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	logs, err := os.Create(filepath.Join(t.TempDir(), "gateway.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin)
+	cmd.Dir = repoRoot
+	cmd.Stdout = logs
+	cmd.Stderr = logs
+	cmd.Env = append(os.Environ(),
+		"DATABASE_URL="+withReplication(t, dbURL),
+		"REDIS_URL="+redisURL,
+		fmt.Sprintf("HTTP_PORT=%d", port),
+		"CDC_SLOT_NAME="+slotName,
+		"CDC_PUBLICATION_NAME="+publication,
+		"REDIS_STREAM_PREFIX="+prefix,
+		"CDC_BACKFILL_MODE=auto",
+		"CDC_BACKFILL_STATE_TABLE="+stateTable,
+		"LOG_LEVEL=DEBUG",
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start gateway: %v", err)
+	}
+
+	gw := &gateway{cmd: cmd, baseURL: baseURL, logs: logs}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		gw.dumpLogsOnFailure(t)
+	})
+
+	// Readiness flips true once replication is streaming.
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("gateway never became ready")
+		}
+		resp, err := http.Get(gw.baseURL + "/readiness")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return gw
+			}
+		}
+		if cmd.ProcessState != nil {
+			t.Fatal("gateway exited before becoming ready")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// stop asks for a graceful shutdown and requires a clean exit, so a hang or
+// panic in teardown (slot release, sink shutdown) fails the test.
+func (g *gateway) stop(t *testing.T) {
+	t.Helper()
+	if err := g.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal gateway: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- g.cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("gateway did not exit cleanly: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		_ = g.cmd.Process.Kill()
+		t.Error("gateway did not shut down within 20s of SIGTERM")
+	}
+}
+
+func (g *gateway) dumpLogsOnFailure(t *testing.T) {
+	if !t.Failed() {
+		return
+	}
+	data, err := os.ReadFile(g.logs.Name())
+	if err != nil {
+		t.Logf("read gateway log: %v", err)
+		return
+	}
+	t.Logf("gateway output:\n%s", data)
+}
+
+// awaitEvents polls the stream until done(events) is true, returning every
+// decoded payload seen so far.
+func awaitEvents(
+	t *testing.T,
+	ctx context.Context,
+	rdb *redis.Client,
+	done func([]payload) bool,
+) []payload {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		msgs, err := rdb.XRange(ctx, stream, "-", "+").Result()
+		if err != nil && err != redis.Nil {
+			t.Fatalf("xrange %s: %v", stream, err)
+		}
+		events := make([]payload, 0, len(msgs))
+		for _, msg := range msgs {
+			raw, ok := msg.Values["payload"].(string)
+			if !ok {
+				t.Fatalf("stream entry without payload field: %v", msg.Values)
+			}
+			var p payload
+			if err := json.Unmarshal([]byte(raw), &p); err != nil {
+				t.Fatalf("bad payload JSON: %v\n%s", err, raw)
+			}
+			events = append(events, p)
+		}
+		if done(events) {
+			return events
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for events; stream has %d entries: %+v",
+				len(events), events)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func eventRowID(p payload) string {
+	if v, ok := p.NewData["id"]; ok {
+		return fmt.Sprint(v)
+	}
+	if v, ok := p.OldData["id"]; ok {
+		return fmt.Sprint(v)
+	}
+	return ""
+}
+
+func distinctIDs(events []payload, op string) map[string]struct{} {
+	ids := make(map[string]struct{})
+	for _, e := range events {
+		if e.Operation == op {
+			ids[eventRowID(e)] = struct{}{}
+		}
+	}
+	return ids
+}
+
+func rowEventCount(events []payload, id string) int {
+	n := 0
+	for _, e := range events {
+		if eventRowID(e) == id {
+			n++
+		}
+	}
+	return n
+}
+
+func mustExec(t *testing.T, ctx context.Context, db *pgx.Conn, sql string, args ...any) {
+	t.Helper()
+	if _, err := db.Exec(ctx, sql, args...); err != nil {
+		t.Fatalf("exec %q: %v", sql, err)
+	}
+}
+
+func withReplication(t *testing.T, dbURL string) string {
+	t.Helper()
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		t.Fatalf("parse database url: %v", err)
+	}
+	q := u.Query()
+	q.Set("replication", "database")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func getJSON(t *testing.T, ctx context.Context, url string, out any) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		t.Fatalf("decode %s: %v", url, err)
+	}
+}

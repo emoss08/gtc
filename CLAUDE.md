@@ -13,6 +13,10 @@ go build -o gateway ./cmd/gateway
 go test ./...
 go run ./cmd/gateway
 
+# End-to-end test (real PostgreSQL wal_level=logical + Redis; also run in CI):
+GTC_TEST_DATABASE_URL=postgres://... GTC_TEST_REDIS_URL=redis://... \
+  go test -tags integration -timeout 5m ./test/integration
+
 # Dashboard (ui/): the built dist/ is committed and embedded via go:embed,
 # so plain `go build` works without Node. After changing ui/src, rebuild:
 cd ui && npm ci && npm run build

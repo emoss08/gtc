@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -199,17 +200,35 @@ func (r *Reader) setupReplication(ctx context.Context) error {
 	return nil
 }
 
+// quoteLiteral makes a string safe to embed in a simple-protocol query.
+// Replication connections reject the extended query protocol (parameterized
+// queries), so catalog checks on r.conn must be plain SQL.
+func quoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// readSimpleQuery runs one simple-protocol query and returns its rows.
+func readSimpleQuery(ctx context.Context, conn *pgconn.PgConn, sql string) ([][][]byte, error) {
+	results, err := conn.Exec(ctx, sql).ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	return results[0].Rows, nil
+}
+
 func (r *Reader) ensurePublication(ctx context.Context) error {
-	checkResult := r.conn.ExecParams(ctx,
-		"SELECT 1 FROM pg_publication WHERE pubname = $1",
-		[][]byte{[]byte(r.config.PublicationName)},
-		nil, nil, nil,
-	).Read()
-	if checkResult.Err != nil {
-		return fmt.Errorf("check publication failed: %w", checkResult.Err)
+	rows, err := readSimpleQuery(ctx, r.conn, fmt.Sprintf(
+		"SELECT 1 FROM pg_publication WHERE pubname = %s",
+		quoteLiteral(r.config.PublicationName),
+	))
+	if err != nil {
+		return fmt.Errorf("check publication failed: %w", err)
 	}
 
-	if len(checkResult.Rows) > 0 {
+	if len(rows) > 0 {
 		r.logger.Info("publication exists", slog.String("publication", r.config.PublicationName))
 		return nil
 	}
@@ -235,17 +254,16 @@ func (r *Reader) ensurePublication(ctx context.Context) error {
 }
 
 func (r *Reader) ensureReplicationSlot(ctx context.Context) (pglogrepl.LSN, error) {
-	checkResult := r.conn.ExecParams(ctx,
-		"SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = $1",
-		[][]byte{[]byte(r.config.SlotName)},
-		nil, nil, nil,
-	).Read()
-	if checkResult.Err != nil {
-		return 0, fmt.Errorf("check replication slot failed: %w", checkResult.Err)
+	rows, err := readSimpleQuery(ctx, r.conn, fmt.Sprintf(
+		"SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = %s",
+		quoteLiteral(r.config.SlotName),
+	))
+	if err != nil {
+		return 0, fmt.Errorf("check replication slot failed: %w", err)
 	}
 
-	if len(checkResult.Rows) > 0 && len(checkResult.Rows[0]) > 0 {
-		lsnStr := string(checkResult.Rows[0][0])
+	if len(rows) > 0 && len(rows[0]) > 0 {
+		lsnStr := string(rows[0][0])
 		startLSN, parseErr := pglogrepl.ParseLSN(lsnStr)
 		if parseErr != nil {
 			return 0, fmt.Errorf("parse confirmed_flush_lsn failed: %w", parseErr)
