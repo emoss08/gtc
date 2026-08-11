@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Shell, type Page } from '@/components/shell';
 import { OverviewPage } from '@/pages/overview';
 import { TablesPage } from '@/pages/tables';
@@ -15,14 +15,19 @@ const PAGE_META: Record<Page, { title: string; description: string }> = {
 
 export function App() {
   const [page, setPage] = useState<Page>('overview');
-  const { data: stats } = useStats();
+  const { data: stats, isError } = useStats();
   const meta = PAGE_META[page];
+
+  useEffect(() => {
+    document.title = `${meta.title} · GTC`;
+  }, [meta.title]);
 
   return (
     <Shell
       page={page}
       onNavigate={setPage}
       stats={stats}
+      offline={isError}
       dlqCount={stats?.dlq.entries ?? 0}
       title={meta.title}
       description={meta.description}

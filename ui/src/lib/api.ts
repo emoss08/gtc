@@ -90,6 +90,8 @@ export const dlqEntrySchema = z.object({
   attempts: z.number(),
   first_failed_at: z.string().optional(),
   last_failed_at: z.string(),
+  // The full parked (already-transformed) event, for inspection.
+  event: z.unknown().optional(),
 });
 
 export const dlqListSchema = z.object({

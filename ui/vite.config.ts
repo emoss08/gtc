@@ -23,7 +23,6 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          react: ['react', 'react-dom'],
           charts: ['recharts', '@nivo/core', '@nivo/pie', '@nivo/bar'],
           data: ['@tanstack/react-table', '@tanstack/react-query', 'react-hook-form', 'zod'],
         },

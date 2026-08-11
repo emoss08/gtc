@@ -66,6 +66,8 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
   retries, breaker state, WAL lag in bytes), health and readiness endpoints,
   structured JSON logs.
 
+![GTC dashboard — pipeline overview](docs/dashboard.png)
+
 ## Quick start
 
 ### Docker Compose

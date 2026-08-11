@@ -22,6 +22,7 @@ func TestStatsEndpointShapesMetrics(t *testing.T) {
 	metrics.EventsReceived.WithLabelValues("statstest", "users", "UPDATE").Add(2)
 	metrics.EventsProcessed.WithLabelValues("statstest-sink", "success").Add(4)
 	metrics.EventsProcessed.WithLabelValues("statstest-sink", "failure").Add(1)
+	metrics.SinkErrors.WithLabelValues("statstest-sink", "timeout").Add(2)
 
 	health := NewHealthStatus()
 	health.SetReady(true)
@@ -32,6 +33,7 @@ func TestStatsEndpointShapesMetrics(t *testing.T) {
 		Checker: health,
 		WAL:     fakeWAL{},
 		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Info:    InstanceInfo{Version: "1.2.3-test", SlotName: "test_slot", Publication: "test_pub"},
 	})
 	srv.startedAt = time.Now().Add(-90 * time.Second)
 
@@ -52,6 +54,16 @@ func TestStatsEndpointShapesMetrics(t *testing.T) {
 	}
 	if resp.UptimeSeconds < 89 {
 		t.Errorf("uptime not tracked: %f", resp.UptimeSeconds)
+	}
+	if resp.Version != "1.2.3-test" || resp.SlotName != "test_slot" || resp.Publication != "test_pub" {
+		t.Errorf("instance info not surfaced: version=%q slot=%q publication=%q",
+			resp.Version, resp.SlotName, resp.Publication)
+	}
+
+	// Other tests share the registry, so only assert lower bounds on the
+	// aggregated operations map.
+	if resp.Operations["INSERT"] < 3 || resp.Operations["UPDATE"] < 2 {
+		t.Errorf("operations map wrong: %+v", resp.Operations)
 	}
 
 	var table *tableStats
@@ -78,6 +90,59 @@ func TestStatsEndpointShapesMetrics(t *testing.T) {
 	}
 	if sink.Succeeded != 4 || sink.Failed != 1 || !sink.Healthy {
 		t.Errorf("sink stats wrong: %+v", *sink)
+	}
+	if sink.ErrorsByType["timeout"] != 2 {
+		t.Errorf("errors_by_type not surfaced: %+v", sink.ErrorsByType)
+	}
+}
+
+func TestHistoryEndpointReturnsSamples(t *testing.T) {
+	srv := New(ServerParams{
+		Config: Config{Port: 0},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	// Drive the sampler directly instead of starting its goroutine.
+	srv.sampler.collect()
+	srv.sampler.collect()
+
+	rec := httptest.NewRecorder()
+	srv.router.ServeHTTP(rec, httptest.NewRequest("GET", "/api/history", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		IntervalSeconds float64  `json:"interval_seconds"`
+		Samples         []sample `json:"samples"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if resp.IntervalSeconds != samplerInterval.Seconds() {
+		t.Errorf("interval_seconds = %f, want %f", resp.IntervalSeconds, samplerInterval.Seconds())
+	}
+	if len(resp.Samples) != 2 {
+		t.Fatalf("expected 2 samples, got %d", len(resp.Samples))
+	}
+	// The registry already has events from other tests in this package, so
+	// the gathered counter must be positive and non-decreasing.
+	if resp.Samples[0].T == 0 || resp.Samples[1].T < resp.Samples[0].T {
+		t.Errorf("sample timestamps wrong: %+v", resp.Samples)
+	}
+	if resp.Samples[1].EventsTotal < resp.Samples[0].EventsTotal {
+		t.Errorf("events_total must be non-decreasing: %+v", resp.Samples)
+	}
+}
+
+func TestSamplerCapsRingBuffer(t *testing.T) {
+	s := newSampler()
+	for range samplerCapacity + 10 {
+		s.collect()
+	}
+	if got := len(s.snapshot()); got != samplerCapacity {
+		t.Errorf("ring buffer not capped: len=%d, want %d", got, samplerCapacity)
 	}
 }
 

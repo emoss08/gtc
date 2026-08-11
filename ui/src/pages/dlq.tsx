@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react';
+import { createContext, useContext, useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTable, type ColumnDef } from '@tanstack/react-table';
-import { Inbox, RefreshCw, RotateCcw, Search, Trash2 } from 'lucide-react';
+import { Eye, Inbox, RefreshCw, RotateCcw, Search, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -29,7 +29,10 @@ const OP_VARIANT: Record<string, 'success' | 'secondary' | 'destructive' | 'outl
   READ: 'outline',
 };
 
+const InspectContext = createContext<(entry: DlqEntry) => void>(() => {});
+
 function RowActions({ entry }: { entry: DlqEntry }) {
+  const inspect = useContext(InspectContext);
   const queryClient = useQueryClient();
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ['dlq'] });
@@ -59,6 +62,14 @@ function RowActions({ entry }: { entry: DlqEntry }) {
 
   return (
     <div className="flex justify-end gap-1.5">
+      <Button
+        size="xs"
+        variant="ghost"
+        onClick={() => inspect(entry)}
+        title="Inspect the parked event payload"
+      >
+        <Eye className="size-3" />
+      </Button>
       <Button
         size="xs"
         variant="outline"
@@ -192,8 +203,57 @@ function RetryAllDialog({ count }: { count: number }) {
   );
 }
 
+function InspectDialog({ entry, onClose }: { entry: DlqEntry | null; onClose: () => void }) {
+  return (
+    <Dialog open={entry !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Parked event</DialogTitle>
+          <DialogDescription>
+            The event payload as it was delivered to the sink (transforms already applied). Retrying
+            re-delivers exactly this payload.
+          </DialogDescription>
+        </DialogHeader>
+        {entry && (
+          <div className="space-y-3">
+            <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs sm:grid-cols-3">
+              {(
+                [
+                  ['Sink', entry.sink],
+                  ['Table', `${entry.schema}.${entry.table}`],
+                  ['Operation', entry.operation],
+                  ['LSN', entry.lsn],
+                  ['Attempts', String(entry.attempts)],
+                  ['Last failed', timeAgo(entry.last_failed_at)],
+                ] as const
+              ).map(([label, value]) => (
+                <div key={label}>
+                  <dt className="text-muted-foreground">{label}</dt>
+                  <dd className="truncate font-mono" title={value}>
+                    {value}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+            <div>
+              <div className="text-muted-foreground mb-1 text-xs">Error</div>
+              <p className="text-destructive text-xs break-words">{entry.error}</p>
+            </div>
+            <pre className="bg-muted max-h-80 overflow-auto rounded-md p-3 font-mono text-xs">
+              {entry.event === undefined
+                ? 'Event payload not included in the API response.'
+                : JSON.stringify(entry.event, null, 2)}
+            </pre>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export function DlqPage({ dlqEnabled }: { dlqEnabled: boolean }) {
   const [filter, setFilter] = useState('');
+  const [inspected, setInspected] = useState<DlqEntry | null>(null);
   const { data } = useDlq(dlqEnabled);
   const entries = useMemo(() => data?.entries ?? [], [data]);
 
@@ -207,7 +267,9 @@ export function DlqPage({ dlqEnabled }: { dlqEnabled: boolean }) {
   });
 
   return (
+    <InspectContext.Provider value={setInspected}>
     <div className="space-y-4">
+      <InspectDialog entry={inspected} onClose={() => setInspected(null)} />
       <div className="flex items-center justify-between gap-3">
         <div className="relative max-w-xs flex-1">
           <Search className="text-muted-foreground absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
@@ -236,5 +298,6 @@ export function DlqPage({ dlqEnabled }: { dlqEnabled: boolean }) {
         </CardContent>
       </Card>
     </div>
+    </InspectContext.Provider>
   );
 }

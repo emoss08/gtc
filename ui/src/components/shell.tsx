@@ -35,6 +35,7 @@ export function Shell({
   page,
   onNavigate,
   stats,
+  offline = false,
   dlqCount,
   title,
   description,
@@ -44,6 +45,7 @@ export function Shell({
   page: Page;
   onNavigate: (page: Page) => void;
   stats: Stats | undefined;
+  offline?: boolean;
   dlqCount: number;
   title: string;
   description: string;
@@ -52,13 +54,13 @@ export function Shell({
 }) {
   return (
     <div className="flex min-h-screen">
-      {/* Sidebar */}
-      <aside className="bg-sidebar text-sidebar-foreground border-sidebar-border fixed inset-y-0 left-0 z-30 flex w-56 flex-col border-r">
-        <div className="flex items-center gap-2.5 px-4 pt-5 pb-4">
-          <div className="flex size-8 items-center justify-center rounded-lg bg-gradient-to-br from-amber-400 to-orange-500 text-white shadow-sm">
+      {/* Sidebar: icon rail on small screens, full labels from lg up */}
+      <aside className="bg-sidebar text-sidebar-foreground border-sidebar-border fixed inset-y-0 left-0 z-30 flex w-14 flex-col border-r lg:w-56">
+        <div className="flex items-center justify-center gap-2.5 px-2 pt-5 pb-4 lg:justify-start lg:px-4">
+          <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-amber-400 to-orange-500 text-white shadow-sm">
             <Zap className="size-4.5" fill="currentColor" strokeWidth={0} />
           </div>
-          <div className="leading-tight">
+          <div className="hidden leading-tight lg:block">
             <div className="text-sm font-bold tracking-tight">GTC</div>
             <div className="text-sidebar-foreground/60 text-[10px] font-medium tracking-wide uppercase">
               Change Data Capture
@@ -66,31 +68,38 @@ export function Shell({
           </div>
         </div>
 
-        <nav className="flex flex-1 flex-col gap-0.5 px-2.5 pt-2">
+        <nav className="flex flex-1 flex-col gap-0.5 px-2 pt-2 lg:px-2.5">
           {NAV.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
               type="button"
+              title={label}
               onClick={() => onNavigate(id)}
               className={cn(
-                'flex cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-2 text-[13px] font-medium transition-colors',
+                'relative flex cursor-pointer items-center justify-center gap-2.5 rounded-md px-2.5 py-2 text-[13px] font-medium transition-colors lg:justify-start',
                 page === id
                   ? 'bg-sidebar-accent text-sidebar-accent-foreground'
                   : 'text-sidebar-foreground/65 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground',
               )}
             >
-              <Icon className="size-4" strokeWidth={page === id ? 2.25 : 2} />
-              <span className="flex-1 text-left">{label}</span>
+              <Icon className="size-4 shrink-0" strokeWidth={page === id ? 2.25 : 2} />
+              <span className="hidden flex-1 text-left lg:block">{label}</span>
               {id === 'dlq' && dlqCount > 0 && (
-                <Badge variant="destructive" className="h-5 min-w-5 px-1.5 tabular-nums">
-                  {dlqCount}
-                </Badge>
+                <>
+                  <Badge
+                    variant="destructive"
+                    className="hidden h-5 min-w-5 px-1.5 tabular-nums lg:inline-flex"
+                  >
+                    {dlqCount}
+                  </Badge>
+                  <span className="absolute top-1.5 right-1.5 size-1.5 rounded-full bg-red-500 lg:hidden" />
+                </>
               )}
             </button>
           ))}
         </nav>
 
-        <div className="border-sidebar-border space-y-3 border-t px-4 py-4">
+        <div className="border-sidebar-border hidden space-y-3 border-t px-4 py-4 lg:block">
           <div className="text-sidebar-foreground/60 flex items-center justify-between text-xs">
             <span className="flex items-center gap-1.5">
               <span
@@ -140,7 +149,12 @@ export function Shell({
       </aside>
 
       {/* Main */}
-      <div className="ml-56 flex min-w-0 flex-1 flex-col">
+      <div className="ml-14 flex min-w-0 flex-1 flex-col lg:ml-56">
+        {offline && (
+          <div className="bg-destructive/90 sticky top-0 z-30 px-6 py-1.5 text-center text-xs font-medium text-white">
+            Cannot reach GTC — the data below may be stale. Retrying…
+          </div>
+        )}
         <header className="bg-background/80 sticky top-0 z-20 border-b backdrop-blur">
           <div className="mx-auto flex h-14 w-full max-w-6xl items-center justify-between gap-4 px-6">
             <div className="min-w-0">
