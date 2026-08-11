@@ -135,6 +135,56 @@ func TestMaskStrategies(t *testing.T) {
 	}
 }
 
+func TestHmac256Mask(t *testing.T) {
+	spec := config.TransformSpec{Mask: map[string]string{"email": "hmac256"}}
+	chain, err := CompileWithOptions(Options{HMACKey: []byte("test-key")}, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mask := func(c *Chain, v string) string {
+		t.Helper()
+		out, _, err := c.Apply(event(domain.OperationInsert, map[string]any{"email": v}, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out.NewData["email"].(string)
+	}
+
+	got := mask(chain, "ada@example.com")
+	if len(got) != 64 || got == "ada@example.com" {
+		t.Fatalf("hmac256 mask failed: %q", got)
+	}
+	if again := mask(chain, "ada@example.com"); again != got {
+		t.Errorf("hmac256 must be deterministic for the same key: %q != %q", again, got)
+	}
+
+	// A plain (unkeyed) sha256 of the same value must differ, otherwise the
+	// key isn't being used and the mask is dictionary-attackable.
+	plain := mustCompile(t, config.TransformSpec{Mask: map[string]string{"email": "sha256"}})
+	if mask(plain, "ada@example.com") == got {
+		t.Error("hmac256 output must differ from unkeyed sha256")
+	}
+
+	// A different key must produce a different digest.
+	other, err := CompileWithOptions(Options{HMACKey: []byte("other-key")}, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mask(other, "ada@example.com") == got {
+		t.Error("different keys must produce different digests")
+	}
+}
+
+func TestHmac256RequiresKey(t *testing.T) {
+	spec := config.TransformSpec{Mask: map[string]string{"email": "hmac256"}}
+	if _, err := Compile(spec); err == nil {
+		t.Fatal("hmac256 without a key must fail compilation")
+	} else if !strings.Contains(err.Error(), "CDC_MASK_HMAC_KEY") {
+		t.Errorf("error must point at the missing env var, got: %v", err)
+	}
+}
+
 func TestMaskAppliesToOldData(t *testing.T) {
 	chain := mustCompile(t, config.TransformSpec{Mask: map[string]string{"email": "redact"}})
 
@@ -190,7 +240,7 @@ func (s *captureSink) Process(_ context.Context, e domain.CDCEvent) error {
 
 func TestSinkAppliesGlobalThenTableChain(t *testing.T) {
 	inner := &captureSink{}
-	sink, err := NewSink(inner,
+	sink, err := NewSink(inner, Options{},
 		&config.TransformSpec{Mask: map[string]string{"email": "redact"}},
 		map[string]config.TransformSpec{
 			"public.users": {DropColumns: []string{"password_hash"}},
@@ -222,7 +272,7 @@ func TestSinkAppliesGlobalThenTableChain(t *testing.T) {
 
 func TestSinkFiltersEvent(t *testing.T) {
 	inner := &captureSink{}
-	sink, err := NewSink(inner, &config.TransformSpec{Filter: `op != "DELETE"`}, nil, slog.Default())
+	sink, err := NewSink(inner, Options{}, &config.TransformSpec{Filter: `op != "DELETE"`}, nil, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +288,7 @@ func TestSinkFiltersEvent(t *testing.T) {
 
 func TestSinkWithoutTransformsIsUnwrapped(t *testing.T) {
 	inner := &captureSink{}
-	sink, err := NewSink(inner, nil, nil, slog.Default())
+	sink, err := NewSink(inner, Options{}, nil, nil, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}

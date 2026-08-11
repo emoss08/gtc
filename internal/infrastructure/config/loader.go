@@ -33,6 +33,7 @@ func Load() (*Config, error) {
 			ChunkDelay: getDuration("CDC_BACKFILL_CHUNK_DELAY", 0),
 			StateTable: backfillStateTable(),
 		},
+		MaskHMACKey: os.Getenv("CDC_MASK_HMAC_KEY"),
 		DLQ: DLQConfig{
 			Enabled:    getBool("CDC_DLQ_ENABLED", true),
 			Threshold:  getInt("CDC_DLQ_THRESHOLD", 3),

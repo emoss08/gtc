@@ -42,9 +42,9 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
 - **Per-table routing** — an optional YAML file selects which tables go to
   which sink and how keys are built, using Go templates
   (`{{.Prefix}}:orders:{{.Field "id"}}`).
-- **Declarative transforms** — PII masking (`sha256`, `last4`, `redact`,
-  `null`), column dropping, and CEL row filters, configured per sink and per
-  table in YAML. The stream can carry full rows while the search index gets
+- **Declarative transforms** — PII masking (`sha256`, keyed `hmac256`,
+  `last4`, `redact`, `null`), column dropping, and CEL row filters,
+  configured per sink and per table in YAML. The stream can carry full rows while the search index gets
   masked ones — no plugin code, no SMT classes.
 - **First-class transactional outbox** — write domain events to an outbox
   table in the same transaction as your business writes, and GTC publishes
@@ -193,6 +193,7 @@ lives in an optional YAML file.
 | `CDC_DLQ_ENABLED` | `true` | Park poison events in Redis instead of stalling forever (needs `REDIS_URL`) |
 | `CDC_DLQ_THRESHOLD` | `3` | Failure cycles for the same event before it is parked |
 | `CDC_DLQ_MAX_ENTRIES` | `10000` | DLQ cap; when full, parking fails and the pipeline stalls |
+| `CDC_MASK_HMAC_KEY` | – | Secret key for the `hmac256` mask strategy (required when a transform uses it) |
 | `SINK_CONFIG_FILE` | – | Path to the per-table sink YAML (below) |
 | `REDIS_URL` | – | Enables the Redis Stream sink |
 | `REDIS_STREAM_PREFIX` | `cdc` | Stream key prefix |
@@ -253,12 +254,18 @@ redis_json:
   that's absent from the event is an error (visible, not silent data loss) —
   guard optional columns with `"col" in new && new.col == ...`.
 - **`mask`** strategies: `redact` (`[REDACTED]`), `null`, `sha256`
-  (deterministic, so masked values still join/dedupe), `last4`
+  (deterministic, so masked values still join/dedupe), `hmac256`
+  (deterministic like `sha256`, but keyed with `CDC_MASK_HMAC_KEY` so the
+  original value can't be recovered by hashing guessed inputs — use this for
+  low-entropy PII like emails and phone numbers), `last4`
   (`************4242`).
 - **`drop_columns`** removes columns entirely.
 
-Transforms are compiled at startup — a typo in a CEL expression or an unknown
-mask strategy fails boot with a clear error instead of surfacing mid-stream.
+Transforms are compiled at startup — a typo in a CEL expression, an unknown
+mask strategy, or `hmac256` without `CDC_MASK_HMAC_KEY` fails boot with a
+clear error instead of surfacing mid-stream. Note that rotating the HMAC key
+changes every digest, so previously-emitted masked values stop matching new
+ones.
 Masking runs before key generation, so don't build sink keys from masked
 columns. Filtered events count in `cdc_events_filtered_total{sink,schema,table}`.
 
