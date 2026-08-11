@@ -1,6 +1,7 @@
 package transform
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -41,6 +42,36 @@ var maskStrategies = map[string]maskFunc{
 	},
 }
 
+// Options carries deployment-level inputs that mask strategies need.
+type Options struct {
+	// HMACKey keys the hmac256 strategy (CDC_MASK_HMAC_KEY). Unlike plain
+	// sha256, values masked with a keyed hash cannot be recovered by hashing
+	// candidate inputs (dictionary attack) without the key, while staying
+	// deterministic so masked columns remain joinable across events.
+	HMACKey []byte
+}
+
+// strategyFunc resolves a mask strategy name, including the keyed hmac256
+// strategy which is only available when a key is configured.
+func strategyFunc(name string, opts Options) (maskFunc, error) {
+	if fn, ok := maskStrategies[name]; ok {
+		return fn, nil
+	}
+	if name == "hmac256" {
+		if len(opts.HMACKey) == 0 {
+			return nil, fmt.Errorf("mask strategy hmac256 requires CDC_MASK_HMAC_KEY to be set")
+		}
+		key := opts.HMACKey
+		return func(v any) any {
+			mac := hmac.New(sha256.New, key)
+			mac.Write([]byte(fmt.Sprintf("%v", v)))
+			return hex.EncodeToString(mac.Sum(nil))
+		}, nil
+	}
+	return nil, fmt.Errorf(
+		"unknown mask strategy %q (valid: redact, null, sha256, hmac256, last4)", name)
+}
+
 // Chain is a compiled sequence of transform specs applied to an event in
 // order. Compilation happens once at startup so bad expressions fail fast.
 type Chain struct {
@@ -56,6 +87,13 @@ type compiledSpec struct {
 // Compile validates and compiles transform specs into a Chain. A nil Chain
 // (no specs) is valid and applies nothing.
 func Compile(specs ...config.TransformSpec) (*Chain, error) {
+	return CompileWithOptions(Options{}, specs...)
+}
+
+// CompileWithOptions is Compile with deployment-level options (e.g. the
+// hmac256 key). Compilation happens once at startup so a strategy whose
+// prerequisites are missing fails fast instead of at event time.
+func CompileWithOptions(opts Options, specs ...config.TransformSpec) (*Chain, error) {
 	var steps []compiledSpec
 
 	var env *cel.Env
@@ -98,11 +136,9 @@ func Compile(specs ...config.TransformSpec) (*Chain, error) {
 		if len(spec.Mask) > 0 {
 			step.mask = make(map[string]maskFunc, len(spec.Mask))
 			for col, strategy := range spec.Mask {
-				fn, ok := maskStrategies[strategy]
-				if !ok {
-					return nil, fmt.Errorf(
-						"unknown mask strategy %q for column %q (valid: redact, null, sha256, last4)",
-						strategy, col)
+				fn, err := strategyFunc(strategy, opts)
+				if err != nil {
+					return nil, fmt.Errorf("mask for column %q: %w", col, err)
 				}
 				step.mask[col] = fn
 			}

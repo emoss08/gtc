@@ -12,7 +12,11 @@
 #                 schema, table, new (row data), old (previous data).
 #                 Guard optional columns: '"status" in new && new.status == "live"'
 #   drop_columns: removed from the event before the sink sees it
-#   mask:         column -> strategy: redact | null | sha256 | last4
+#   mask:         column -> strategy: redact | null | sha256 | hmac256 | last4
+#                 hmac256 is a keyed sha256 (HMAC) using CDC_MASK_HMAC_KEY;
+#                 unlike plain sha256 it cannot be reversed by hashing guessed
+#                 inputs, while staying deterministic (joinable). Startup fails
+#                 if hmac256 is used without the key set.
 #
 # Transforms are per sink: the stream sink can carry full rows while the
 # search index receives masked ones. Masking runs before key generation, so

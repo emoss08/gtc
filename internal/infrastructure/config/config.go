@@ -23,6 +23,9 @@ type Config struct {
 	SlotRetryTimeout  time.Duration
 	Backfill          BackfillConfig
 	DLQ               DLQConfig
+	// MaskHMACKey keys the hmac256 mask strategy in sink transforms. Empty
+	// means the strategy is unavailable (configs using it fail at startup).
+	MaskHMACKey string
 }
 
 type DLQConfig struct {

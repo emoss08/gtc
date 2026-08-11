@@ -27,6 +27,7 @@ var _ domain.Sink = (*Sink)(nil)
 // inner unchanged when no transforms are configured.
 func NewSink(
 	inner domain.Sink,
+	opts Options,
 	global *config.TransformSpec,
 	tables map[string]config.TransformSpec,
 	logger *slog.Logger,
@@ -34,7 +35,7 @@ func NewSink(
 	var globalChain *Chain
 	if global != nil {
 		var err error
-		globalChain, err = Compile(*global)
+		globalChain, err = CompileWithOptions(opts, *global)
 		if err != nil {
 			return nil, fmt.Errorf("sink %s transform: %w", inner.Name(), err)
 		}
@@ -42,7 +43,7 @@ func NewSink(
 
 	tableChains := make(map[string]*Chain, len(tables))
 	for name, spec := range tables {
-		chain, err := Compile(spec)
+		chain, err := CompileWithOptions(opts, spec)
 		if err != nil {
 			return nil, fmt.Errorf("sink %s, table %s transform: %w", inner.Name(), name, err)
 		}

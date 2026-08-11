@@ -187,12 +187,13 @@ func newSinks(
 		return wrapped
 	}
 
+	transformOpts := transform.Options{HMACKey: []byte(cfg.MaskHMACKey)}
 	addSink := func(
 		sink domain.Sink,
 		global *config.TransformSpec,
 		tables map[string]config.TransformSpec,
 	) error {
-		wrapped, err := transform.NewSink(wrapResilienceAndDLQ(sink), global, tables, logger)
+		wrapped, err := transform.NewSink(wrapResilienceAndDLQ(sink), transformOpts, global, tables, logger)
 		if err != nil {
 			return err
 		}

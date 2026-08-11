@@ -89,6 +89,7 @@ Consequences to keep in mind:
 | CDC_DLQ_ENABLED | true | Park poison events in Redis instead of stalling forever (needs REDIS_URL) |
 | CDC_DLQ_THRESHOLD | 3 | Failure cycles for the same event before it is parked |
 | CDC_DLQ_MAX_ENTRIES | 10000 | DLQ cap; when full, parking fails and the pipeline stalls |
+| CDC_MASK_HMAC_KEY | - | Secret key for the hmac256 mask strategy (startup fails if a transform uses hmac256 without it) |
 | SINK_CONFIG_FILE | - | Path to per-table sink YAML (see config/sinks.example.yaml). Without it, Redis sinks mirror all tables |
 | REDIS_URL | - | Redis connection (enables stream sink if set) |
 | REDIS_STREAM_PREFIX | cdc | Stream key prefix |
@@ -106,7 +107,8 @@ DELETE events, which would make the delete target the wrong key.
 Sink YAML also carries declarative transforms (per sink `transform:` block
 and per-table object entries): CEL `filter` expressions (variables op,
 schema, table, new, old), `drop_columns`, and `mask` strategies (redact,
-null, sha256, last4). Transforms compile at startup (fail fast), are applied
+null, sha256, hmac256 — keyed by CDC_MASK_HMAC_KEY — and last4).
+Transforms compile at startup (fail fast), are applied
 per sink outside the resilience wrapper, and never mutate the shared event —
 see `internal/infrastructure/transform` and config/sinks.example.yaml.
 
