@@ -27,6 +27,15 @@ type Server struct {
 	wal        WALInfo
 	ui         fs.FS
 	startedAt  time.Time
+	sampler    *sampler
+	info       InstanceInfo
+}
+
+// InstanceInfo is static build/config context surfaced to the dashboard.
+type InstanceInfo struct {
+	Version     string
+	SlotName    string
+	Publication string
 }
 
 type HealthChecker interface {
@@ -45,6 +54,7 @@ type ServerParams struct {
 	DLQ      ports.DLQManager      // nil when the DLQ is disabled
 	WAL      WALInfo               // reader state for /api/stats
 	UI       fs.FS                 // embedded dashboard; nil disables it
+	Info     InstanceInfo
 	Logger   *slog.Logger
 }
 
@@ -65,6 +75,8 @@ func New(p ServerParams) *Server {
 		wal:       p.WAL,
 		ui:        p.UI,
 		startedAt: time.Now(),
+		sampler:   newSampler(),
+		info:      p.Info,
 		httpServer: &http.Server{
 			Addr:         fmt.Sprintf(":%d", p.Config.Port),
 			Handler:      r,
@@ -88,6 +100,7 @@ func (s *Server) registerRoutes() {
 	s.router.Post("/dlq/retry", s.handleDLQRetry)
 	s.router.Post("/dlq/discard", s.handleDLQDiscard)
 	s.router.Get("/api/stats", s.handleStats)
+	s.router.Get("/api/history", s.handleHistory)
 
 	if s.ui != nil {
 		s.router.Get("/*", s.handleUI())
@@ -285,6 +298,7 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) Start() error {
 	s.logger.Info("starting HTTP server", slog.String("addr", s.httpServer.Addr))
+	go s.sampler.run()
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
@@ -293,6 +307,7 @@ func (s *Server) Start() error {
 
 func (s *Server) Stop(ctx context.Context) error {
 	s.logger.Info("stopping HTTP server")
+	s.sampler.close()
 	return s.httpServer.Shutdown(ctx)
 }
 

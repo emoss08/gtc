@@ -142,7 +142,7 @@ internal/
     dlq/               # Dead-letter queue (Redis store, parking decorator, triage)
     server/            # HTTP server: health/readiness/metrics, APIs, dashboard
     metrics/           # Prometheus metrics
-ui/                    # Svelte 5 + Tailwind dashboard; dist/ committed + embedded
+ui/                    # React 19 + Tailwind dashboard; dist/ committed + embedded
 ```
 
 ## Adding New Sinks
