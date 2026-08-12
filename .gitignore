@@ -2,3 +2,4 @@
 *.exe
 /gateway
 tmp/
+dump.rdb

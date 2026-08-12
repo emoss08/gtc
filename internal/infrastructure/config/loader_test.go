@@ -49,11 +49,11 @@ func TestParseTableSet(t *testing.T) {
 	}
 }
 
-func TestRedisKeyedSinkConfig(t *testing.T) {
-	cfg := RedisKeyedSinkConfig{
+func TestKeyedSinkConfig(t *testing.T) {
+	cfg := KeyedSinkConfig{
 		SyncAll:           false,
 		DefaultKeyPattern: "default-pattern",
-		Tables: map[string]RedisTableConfig{
+		Tables: map[string]TableConfig{
 			"public.orders": {Key: "orders-pattern"},
 			"events":        {Key: "events-pattern"},
 		},

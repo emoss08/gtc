@@ -8,9 +8,11 @@ import (
 )
 
 type SinksConfig struct {
-	RedisStream RedisKeyedSinkConfig  `yaml:"redis_stream"`
-	RedisJSON   RedisKeyedSinkConfig  `yaml:"redis_json"`
+	RedisStream KeyedSinkConfig       `yaml:"redis_stream"`
+	RedisJSON   KeyedSinkConfig       `yaml:"redis_json"`
 	Meilisearch MeilisearchSinkConfig `yaml:"meilisearch"`
+	Webhook     KeyedSinkConfig       `yaml:"webhook"`
+	NATS        KeyedSinkConfig       `yaml:"nats"`
 	Outbox      OutboxConfig          `yaml:"outbox"`
 }
 
@@ -92,32 +94,33 @@ func (t TransformSpec) IsZero() bool {
 	return t.Filter == "" && len(t.DropColumns) == 0 && len(t.Mask) == 0
 }
 
-// RedisTableConfig is the per-table entry for a Redis-backed sink. In YAML it
-// is either a plain string (the key pattern, kept for backward compatibility)
-// or an object with a key pattern and transforms.
-type RedisTableConfig struct {
+// TableConfig is the per-table entry for a key-templated sink (Redis stream,
+// RedisJSON, webhook, NATS). In YAML it is either a plain string (the key
+// pattern, kept for backward compatibility) or an object with a key pattern
+// and transforms.
+type TableConfig struct {
 	Key           string `yaml:"key"`
 	TransformSpec `yaml:",inline"`
 }
 
-func (c *RedisTableConfig) UnmarshalYAML(node *yaml.Node) error {
+func (c *TableConfig) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind == yaml.ScalarNode {
 		return node.Decode(&c.Key)
 	}
-	type raw RedisTableConfig
+	type raw TableConfig
 	return node.Decode((*raw)(c))
 }
 
-// RedisKeyedSinkConfig configures a Redis-backed sink whose keys are built
+// KeyedSinkConfig configures a Redis-backed sink whose keys are built
 // from a per-table key pattern. It is shared by the stream and JSON sinks.
-type RedisKeyedSinkConfig struct {
-	SyncAll           bool                        `yaml:"sync_all"`
-	DefaultKeyPattern string                      `yaml:"default_key_pattern"`
-	Transform         *TransformSpec              `yaml:"transform"`
-	Tables            map[string]RedisTableConfig `yaml:"tables"`
+type KeyedSinkConfig struct {
+	SyncAll           bool                   `yaml:"sync_all"`
+	DefaultKeyPattern string                 `yaml:"default_key_pattern"`
+	Transform         *TransformSpec         `yaml:"transform"`
+	Tables            map[string]TableConfig `yaml:"tables"`
 }
 
-func (c *RedisKeyedSinkConfig) ShouldProcess(schema, table string) bool {
+func (c *KeyedSinkConfig) ShouldProcess(schema, table string) bool {
 	fullName := fmt.Sprintf("%s.%s", schema, table)
 
 	if _, ok := c.Tables[fullName]; ok {
@@ -132,7 +135,7 @@ func (c *RedisKeyedSinkConfig) ShouldProcess(schema, table string) bool {
 
 // GetKeyPattern returns the configured pattern for the table, or "" when
 // nothing is configured; the sink's key resolver applies its own default.
-func (c *RedisKeyedSinkConfig) GetKeyPattern(schema, table string) string {
+func (c *KeyedSinkConfig) GetKeyPattern(schema, table string) string {
 	fullName := fmt.Sprintf("%s.%s", schema, table)
 
 	if tc, ok := c.Tables[fullName]; ok && tc.Key != "" {
@@ -148,7 +151,7 @@ func (c *RedisKeyedSinkConfig) GetKeyPattern(schema, table string) string {
 
 // TableTransforms returns the per-table transform specs keyed by the table
 // name as written in the config.
-func (c *RedisKeyedSinkConfig) TableTransforms() map[string]TransformSpec {
+func (c *KeyedSinkConfig) TableTransforms() map[string]TransformSpec {
 	out := make(map[string]TransformSpec)
 	for name, tc := range c.Tables {
 		if !tc.TransformSpec.IsZero() {
@@ -216,20 +219,22 @@ func LoadSinksConfig() (*SinksConfig, error) {
 		}
 	}
 
-	if cfg.RedisStream.Tables == nil {
-		cfg.RedisStream.Tables = make(map[string]RedisTableConfig)
+	// Every key-templated sink mirrors all tables when there is no config
+	// file to narrow it down (the plug-and-play default); Meilisearch is the
+	// exception, since an index must be named per table.
+	keyed := []*KeyedSinkConfig{
+		&cfg.RedisStream, &cfg.RedisJSON, &cfg.Webhook, &cfg.NATS,
 	}
-	if cfg.RedisJSON.Tables == nil {
-		cfg.RedisJSON.Tables = make(map[string]RedisTableConfig)
+	for _, sink := range keyed {
+		if sink.Tables == nil {
+			sink.Tables = make(map[string]TableConfig)
+		}
+		if configPath == "" {
+			sink.SyncAll = true
+		}
 	}
 	if cfg.Meilisearch.Tables == nil {
 		cfg.Meilisearch.Tables = make(map[string]MeiliTableConfig)
-	}
-
-	// Plug-and-play default: with no sink config file, mirror every table.
-	if configPath == "" {
-		cfg.RedisStream.SyncAll = true
-		cfg.RedisJSON.SyncAll = true
 	}
 
 	if cfg.Outbox.Enabled() {

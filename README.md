@@ -16,14 +16,18 @@ streaming platform to get there.
 ```
 PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (event bus)
                                        ├──▶ RedisJSON       (document mirror / cache)
-                                       └──▶ Meilisearch     (search index)
+                                       ├──▶ Meilisearch     (search index)
+                                       ├──▶ NATS JetStream  (durable pub/sub)
+                                       └──▶ Webhooks        (any HTTP endpoint)
 ```
 
 ## Features
 
 - **Single binary, plug and play** — point it at a database with
   `wal_level=logical`, set a Redis URL, and every table is mirrored. The
-  replication slot and publication are created automatically.
+  replication slot and publication are created automatically, and
+  `gtc doctor` verifies the whole environment (settings, privileges, sinks)
+  before the first run.
 - **Lock-free initial backfill** — on first start, existing table data is
   synced to the sinks *concurrently with live streaming* using watermark
   chunking (the DBLog algorithm): no table locks, no paused replication, and
@@ -33,9 +37,12 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
   only at transaction commit boundaries, after every sink has processed every
   event. A failed sink means teardown and replay, never silent loss.
 - **Sinks built in** — Redis Streams (fan-out event bus with `XADD`),
-  RedisJSON (one JSON document per row, partial merges on update), and
+  RedisJSON (one JSON document per row, partial merges on update),
   Meilisearch (partial document updates, waits for task completion so
-  indexing failures surface as errors).
+  indexing failures surface as errors), NATS JetStream (acknowledged,
+  server-side deduplicated publishes), and webhooks (a signed POST per event
+  to any HTTP endpoint). Every sink is independently filtered, transformed,
+  retried and circuit-broken.
 - **Correct TOAST handling** — unchanged TOAST columns are omitted and
   reported, not replaced with placeholder garbage; sinks merge instead of
   clobbering.
@@ -46,6 +53,11 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
   `last4`, `redact`, `null`), column dropping, and CEL row filters,
   configured per sink and per table in YAML. The stream can carry full rows while the search index gets
   masked ones — no plugin code, no SMT classes.
+- **Schema-change awareness** — GTC notices when a published table gains,
+  loses or retypes a column, changes replica identity, or is renamed, and
+  reports it on the dashboard, in `/api/schema`, in Prometheus, and on a
+  Redis notification stream — flagging changes that can break consumers. No
+  DDL triggers, no schema-history topic, no superuser.
 - **First-class transactional outbox** — write domain events to an outbox
   table in the same transaction as your business writes, and GTC publishes
   them to per-topic Redis streams with optional delete-after-publish. Five
@@ -60,8 +72,9 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
   silently dropped.
 - **Embedded live dashboard** — a React dashboard served from the binary at
   `/` (PocketBase-style, no separate deployment): live throughput, WAL lag,
-  sink health and breaker states, per-table activity, backfill progress, and
-  DLQ triage with one-click retry/discard. Light and dark themes.
+  sink health and breaker states, per-table activity, schema-change history,
+  backfill progress, and DLQ triage with one-click retry/discard. Light and
+  dark themes.
 - **Observability** — Prometheus metrics (events, per-sink latency, errors,
   retries, breaker state, WAL lag in bytes), health and readiness endpoints,
   structured JSON logs.
@@ -137,6 +150,34 @@ enable the other sinks. `gateway --version` prints the build version.
 > (`SELECT pg_drop_replication_slot('cdc_demo_slot');`) or your disk will
 > slowly fill.
 
+### Preflight: `gtc doctor`
+
+Before the first run (or when something is off), let GTC diagnose the
+environment instead of reading startup logs:
+
+```bash
+DATABASE_URL="postgres://...?replication=database" REDIS_URL="redis://..." \
+./gateway doctor
+```
+
+It verifies everything in one pass — `wal_level`, replication privileges
+(including a real `IDENTIFY_SYSTEM` handshake), free replication slots and
+WAL senders, publication/slot existence vs. auto-create permissions, tables
+that would reject UPDATE/DELETE for lack of a replica identity, sink
+reachability (Redis `PING`, RedisJSON module presence, Meilisearch health),
+transform compilation, and whether your sink timeouts fit inside
+`wal_sender_timeout` — then exits 0 if GTC is ready to stream, 1 if
+something needs fixing, with a concrete hint per finding:
+
+```
+PostgreSQL
+  ✓ connection             PostgreSQL 16.13
+  ✗ wal_level              "replica" — logical replication needs wal_level=logical
+                           (ALTER SYSTEM SET wal_level = 'logical'; then restart PostgreSQL)
+  ✓ privileges             user "postgres" is superuser
+  ...
+```
+
 ## Event format
 
 Redis Stream entries carry two fields — `event_id` (dedupe key) and
@@ -194,6 +235,7 @@ lives in an optional YAML file.
 | `CDC_DLQ_THRESHOLD` | `3` | Failure cycles for the same event before it is parked |
 | `CDC_DLQ_MAX_ENTRIES` | `10000` | DLQ cap; when full, parking fails and the pipeline stalls |
 | `CDC_MASK_HMAC_KEY` | – | Secret key for the `hmac256` mask strategy (required when a transform uses it) |
+| `CDC_SCHEMA_EVENTS` | `true` | Publish detected DDL changes to the `<prefix>:schema` Redis stream (detection, metrics and `/api/schema` are always on) |
 | `SINK_CONFIG_FILE` | – | Path to the per-table sink YAML (below) |
 | `REDIS_URL` | – | Enables the Redis Stream sink |
 | `REDIS_STREAM_PREFIX` | `cdc` | Stream key prefix |
@@ -202,6 +244,19 @@ lives in an optional YAML file.
 | `REDIS_JSON_PREFIX` | `cdc` | RedisJSON key prefix |
 | `MEILISEARCH_URL` | – | Enables the Meilisearch sink |
 | `MEILISEARCH_API_KEY` | – | Meilisearch API key |
+| `NATS_URL` | – | Enables the NATS sink (`nats://host:4222`; comma-separated for a cluster) |
+| `NATS_SUBJECT_PREFIX` | `cdc` | Subject prefix: `<prefix>.<schema>.<table>` |
+| `NATS_JETSTREAM` | `true` | Publish through JetStream (acknowledged + deduplicated). `false` is fire-and-forget |
+| `NATS_STREAM` | `GTC` | JetStream stream capturing `<prefix>.>` |
+| `NATS_AUTO_CREATE_STREAM` | `true` | Create that stream when missing |
+| `NATS_CREDENTIALS` | – | Path to a NATS `.creds` file |
+| `NATS_TOKEN` | – | NATS auth token |
+| `NATS_TIMEOUT` | `5s` | Connect, publish and flush timeout |
+| `WEBHOOK_URL` | – | Enables the webhook sink; receives one POST per event |
+| `WEBHOOK_SIGNING_SECRET` | – | HMAC-SHA256 key for `X-GTC-Signature` (strongly recommended) |
+| `WEBHOOK_AUTH_HEADER` | – | Sent verbatim as the `Authorization` header |
+| `WEBHOOK_TIMEOUT` | `5s` | Per-delivery HTTP timeout |
+| `WEBHOOK_MAX_IDLE_CONNS` | `10` | Connection pool size for the receiver |
 
 ### Per-table sink routing
 
@@ -319,6 +374,122 @@ Behavior worth knowing:
 - Delivery is at-least-once like everything else; consumers dedupe by the
   `id` field.
 
+## Webhook and NATS sinks
+
+Both are enabled the same way as every other sink — set a URL — and both
+respect per-table filtering and transforms from `SINK_CONFIG_FILE`.
+
+### Webhook
+
+```bash
+WEBHOOK_URL="https://example.com/hooks/gtc" \
+WEBHOOK_SIGNING_SECRET="$(openssl rand -hex 32)" ./gateway
+```
+
+Each event is one `POST` with the same JSON body the Redis stream carries,
+plus headers:
+
+| Header | Purpose |
+|--------|---------|
+| `X-GTC-Event-Id` | The event's LSN — **dedupe on this**, delivery is at-least-once |
+| `X-GTC-Table` | `schema.table`, for cheap routing without parsing the body |
+| `X-GTC-Operation` | `INSERT`/`UPDATE`/`DELETE`/`READ`/`TRUNCATE` |
+| `X-GTC-Timestamp` | Unix seconds, signed alongside the body |
+| `X-GTC-Signature` | `sha256=<hex>` — HMAC-SHA256 over `"<timestamp>.<body>"` |
+
+Verify a delivery (Go):
+
+```go
+mac := hmac.New(sha256.New, []byte(secret))
+mac.Write([]byte(r.Header.Get("X-GTC-Timestamp") + "."))
+mac.Write(body)
+ok := hmac.Equal([]byte(r.Header.Get("X-GTC-Signature")),
+    []byte("sha256="+hex.EncodeToString(mac.Sum(nil))))
+```
+
+Any 2xx is success. Anything else — or a timeout — fails the event, so it is
+retried and eventually dead-lettered rather than silently lost, and the WAL
+position does not advance past it. Because the receiver is in the replication
+path, keep it fast: `WEBHOOK_TIMEOUT` defaults to 5s and sink-count × timeout
+must stay under `wal_sender_timeout` (`gtc doctor` checks this).
+
+### NATS
+
+```bash
+NATS_URL="nats://localhost:4222" ./gateway
+```
+
+Events publish to `<NATS_SUBJECT_PREFIX>.<schema>.<table>`, and the stream
+capturing `<prefix>.>` is created automatically. JetStream is the default
+because it acknowledges each publish — a delivery is only counted once the
+server has persisted it — and because publishing with the event's LSN as the
+message ID lets **JetStream collapse the duplicates** that at-least-once
+redelivery produces. Setting `NATS_JETSTREAM=false` falls back to core NATS,
+which is fire-and-forget: events vanish when nobody is subscribed, so
+`gtc doctor` warns about it.
+
+Subjects come from the same template engine as Redis keys, so a table can be
+routed by column value:
+
+```yaml
+nats:
+  sync_all: true
+  tables:
+    public.orders: "{{.Prefix}}.orders.{{.Field \"status\"}}"
+```
+
+Wildcards and whitespace that PostgreSQL allows in identifiers but NATS
+rejects in subjects (`*`, `>`, spaces) become underscores.
+
+## Schema changes (DDL)
+
+PostgreSQL's logical decoding does not stream DDL statements — there is no
+`ALTER TABLE` event to subscribe to. What it *does* do is re-describe a
+published table whenever its shape has changed, immediately before that
+table's next row change. GTC diffs those descriptions and reports the
+**effect** of the DDL:
+
+| Detected | Kind | Breaking? |
+|----------|------|-----------|
+| New column | `column_added` | no — additive |
+| Column removed | `column_dropped` | yes |
+| Column type altered | `column_type_changed` | yes |
+| Primary key / identity index replaced | `key_changed` | yes |
+| `REPLICA IDENTITY` altered | `replica_identity_changed` | yes |
+| Table renamed or moved schema | `table_renamed` | yes |
+
+Every change is counted in `cdc_schema_changes_total{schema,table,kind}`,
+logged (breaking ones at WARN, so existing log alerting picks them up), kept
+in a rolling in-memory history behind `GET /api/schema`, and shown on the
+dashboard's **Schema** page. With `REDIS_URL` set, it is also published to
+the `<REDIS_STREAM_PREFIX>:schema` stream so consumers can react
+programmatically:
+
+```bash
+redis-cli XRANGE cdc:schema - +
+# fields: table, lsn, breaking, payload (full JSON diff)
+```
+
+Set `CDC_SCHEMA_EVENTS=false` to keep detection, metrics and the API while
+skipping the Redis stream.
+
+None of this needs DDL triggers, a schema-history topic, or superuser — it
+falls out of the replication stream you are already reading. Two honest
+limitations follow from that:
+
+- **Detection is tied to the next row change.** A table altered at 02:00 and
+  first written at 09:00 reports its change at 09:00. The LSN on the change
+  is where GTC *detected* it, not where the DDL committed.
+- **Several statements can collapse into one change.** If a column is added
+  and another dropped between two row changes, they arrive as a single
+  combined change — the net effect, not a statement log.
+
+Unlike row events, schema notifications are **best-effort**: a change cannot
+be re-derived on redelivery (a reconnect re-describes the table with nothing
+to diff against), so a failed Redis publish is counted in
+`cdc_schema_publish_errors_total` and logged rather than stalling the
+pipeline. Row delivery keeps its at-least-once guarantee regardless.
+
 ## Backfill and replay
 
 GTC syncs *existing* data, not just new changes. When the replication slot is
@@ -423,6 +594,7 @@ networks.
 |----------|---------|
 | `GET /` | Embedded dashboard |
 | `GET /api/stats` | Dashboard's JSON snapshot (uptime, lag, sinks, tables, backfill, DLQ) |
+| `GET /api/schema` | Recently detected schema (DDL) changes, newest first |
 | `GET /health` | Liveness — process is up |
 | `GET /readiness` | Readiness — live replication stream **and** all sinks healthy |
 | `GET /metrics` | Prometheus metrics |

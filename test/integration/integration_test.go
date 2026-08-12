@@ -18,16 +18,21 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -37,11 +42,64 @@ const (
 	prefix      = "gtcit"
 	table       = "gtc_it_users"
 	stateTable  = "gtc_it_backfill_state"
+	natsStream  = "GTC_IT"
 	stream      = prefix + ":public:" + table
 )
 
+// webhookReceiver is a real HTTP endpoint the gateway subprocess delivers to.
+type webhookReceiver struct {
+	mu     sync.Mutex
+	events []payload
+	server *httptest.Server
+}
+
+func startWebhookReceiver(t *testing.T) *webhookReceiver {
+	t.Helper()
+	rec := &webhookReceiver{}
+	rec.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p payload
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.Header.Get("X-GTC-Event-Id") == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		rec.mu.Lock()
+		rec.events = append(rec.events, p)
+		rec.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(rec.server.Close)
+	return rec
+}
+
+func (w *webhookReceiver) snapshot() []payload {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]payload(nil), w.events...)
+}
+
+// await blocks until done(received) or the deadline passes.
+func (w *webhookReceiver) await(t *testing.T, done func([]payload) bool) []payload {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		got := w.snapshot()
+		if done(got) {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for webhook deliveries; got %d: %+v", len(got), got)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 type payload struct {
 	Operation string         `json:"operation"`
+	Table     string         `json:"table"`
 	NewData   map[string]any `json:"new_data"`
 	OldData   map[string]any `json:"old_data"`
 }
@@ -81,7 +139,7 @@ func TestEndToEnd(t *testing.T) {
 		_, _ = db.Exec(context.Background(),
 			"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
 			slotName)
-		_ = rdb.Del(context.Background(), stream).Err()
+		_ = rdb.Del(context.Background(), stream, prefix+":schema").Err()
 	}
 	cleanup()          // leftovers from an aborted previous run
 	t.Cleanup(cleanup) // called after the gateway has been stopped
@@ -96,7 +154,16 @@ func TestEndToEnd(t *testing.T) {
 			i, fmt.Sprintf("seed-%d", i), fmt.Sprintf("seed-%d@example.com", i))
 	}
 
-	gw := startGateway(t, ctx, dbURL, redisURL)
+	bin := buildGateway(t, ctx)
+
+	// Preflight: `gtc doctor` must pass against a correctly provisioned
+	// environment, and fail when a sink is unreachable.
+	runDoctor(t, ctx, bin, dbURL, redisURL, true)
+	runDoctor(t, ctx, bin, dbURL, "redis://127.0.0.1:1/", false)
+
+	hook := startWebhookReceiver(t)
+	natsURL := os.Getenv("GTC_TEST_NATS_URL")
+	gw := startGateway(t, ctx, bin, dbURL, redisURL, hook.server.URL, natsURL)
 
 	// Backfill: three READ events, one per pre-existing row.
 	events := awaitEvents(t, ctx, rdb, func(seen []payload) bool {
@@ -148,6 +215,62 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("row 4 operations = %v, want %v (per-key order must hold)", ops, want)
 	}
 
+	// The webhook sink delivered the same live changes over HTTP.
+	hookEvents := hook.await(t, func(got []payload) bool {
+		return rowEventCount(got, "4") >= 3
+	})
+	var hookOps []string
+	for _, e := range hookEvents {
+		if eventRowID(e) == "4" && (len(hookOps) == 0 || hookOps[len(hookOps)-1] != e.Operation) {
+			hookOps = append(hookOps, e.Operation)
+		}
+	}
+	if want := []string{"INSERT", "UPDATE", "DELETE"}; !slices.Equal(hookOps, want) {
+		t.Errorf("webhook row 4 operations = %v, want %v", hookOps, want)
+	}
+
+	// The NATS sink publishes the same events when a server is available.
+	if natsURL != "" {
+		assertNATSDelivery(t, ctx, natsURL)
+	} else {
+		t.Log("GTC_TEST_NATS_URL unset; skipping NATS sink assertions")
+	}
+
+	// DDL: PostgreSQL re-describes the table before the next row change, and
+	// GTC turns that into a schema-change notification.
+	mustExec(t, ctx, db, fmt.Sprintf("ALTER TABLE %s ADD COLUMN nickname text", table))
+	mustExec(t, ctx, db, fmt.Sprintf("ALTER TABLE %s DROP COLUMN email", table))
+	mustExec(t, ctx, db, fmt.Sprintf(
+		"INSERT INTO %s (id, name, nickname) VALUES (5, 'grace', 'amazing grace')", table))
+
+	ddl := awaitSchemaChange(t, ctx, gw.baseURL, fmt.Sprintf("public.%s", table))
+	if !ddl.Breaking {
+		t.Errorf("dropping a column must be reported as breaking: %+v", ddl)
+	}
+	if !slices.Contains(ddl.Kinds, "column_added") || !slices.Contains(ddl.Kinds, "column_dropped") {
+		t.Errorf("kinds = %v, want both column_added and column_dropped", ddl.Kinds)
+	}
+	if len(ddl.AddedColumns) != 1 || ddl.AddedColumns[0].Name != "nickname" {
+		t.Errorf("added columns = %+v", ddl.AddedColumns)
+	}
+	if ddl.AddedColumns[0].Type != "text" {
+		t.Errorf("added column type = %q, want text", ddl.AddedColumns[0].Type)
+	}
+	if len(ddl.DroppedColumns) != 1 || ddl.DroppedColumns[0].Name != "email" {
+		t.Errorf("dropped columns = %+v", ddl.DroppedColumns)
+	}
+
+	// The same change reaches the schema notification stream. The recorder
+	// behind /api/schema and the Redis publisher are independent observers,
+	// so the API can be ahead of the stream by a few hundred microseconds.
+	last := awaitSchemaStreamEntry(t, ctx, rdb)
+	if got := last["table"]; got != "public."+table {
+		t.Errorf("schema entry table = %v", got)
+	}
+	if got := last["breaking"]; got != "true" {
+		t.Errorf("schema entry breaking = %v, want true", got)
+	}
+
 	// The dashboard's stats endpoint sees the same pipeline.
 	var stats struct {
 		Streaming   bool    `json:"streaming"`
@@ -168,7 +291,7 @@ type gateway struct {
 	logs    *os.File
 }
 
-func startGateway(t *testing.T, ctx context.Context, dbURL, redisURL string) *gateway {
+func buildGateway(t *testing.T, ctx context.Context) string {
 	t.Helper()
 
 	repoRoot, err := filepath.Abs("../..")
@@ -181,6 +304,41 @@ func startGateway(t *testing.T, ctx context.Context, dbURL, redisURL string) *ga
 	build.Dir = repoRoot
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build gateway: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// runDoctor executes `gateway doctor` and asserts on its exit code.
+func runDoctor(t *testing.T, ctx context.Context, bin, dbURL, redisURL string, wantOK bool) {
+	t.Helper()
+
+	cmd := exec.CommandContext(ctx, bin, "doctor")
+	cmd.Env = append(os.Environ(),
+		"DATABASE_URL="+withReplication(t, dbURL),
+		"REDIS_URL="+redisURL,
+		"CDC_SLOT_NAME="+slotName,
+		"CDC_PUBLICATION_NAME="+publication,
+	)
+	out, err := cmd.CombinedOutput()
+	ok := err == nil
+	if ok != wantOK {
+		t.Fatalf("doctor exit ok=%v, want %v; output:\n%s", ok, wantOK, out)
+	}
+	if wantOK && !strings.Contains(string(out), "Ready to stream.") {
+		t.Fatalf("doctor passed without the ready line:\n%s", out)
+	}
+}
+
+func startGateway(
+	t *testing.T,
+	ctx context.Context,
+	bin, dbURL, redisURL, webhookURL, natsURL string,
+) *gateway {
+	t.Helper()
+
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	port := freePort(t)
@@ -204,6 +362,11 @@ func startGateway(t *testing.T, ctx context.Context, dbURL, redisURL string) *ga
 		"REDIS_STREAM_PREFIX="+prefix,
 		"CDC_BACKFILL_MODE=auto",
 		"CDC_BACKFILL_STATE_TABLE="+stateTable,
+		"WEBHOOK_URL="+webhookURL,
+		"WEBHOOK_SIGNING_SECRET=integration-secret",
+		"NATS_URL="+natsURL,
+		"NATS_SUBJECT_PREFIX="+prefix,
+		"NATS_STREAM="+natsStream,
 		"LOG_LEVEL=DEBUG",
 	)
 	if err := cmd.Start(); err != nil {
@@ -304,6 +467,103 @@ func awaitEvents(
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for events; stream has %d entries: %+v",
 				len(events), events)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+type schemaChange struct {
+	Schema         string   `json:"schema"`
+	Table          string   `json:"table"`
+	Kinds          []string `json:"kinds"`
+	Breaking       bool     `json:"breaking"`
+	Summary        string   `json:"summary"`
+	AddedColumns   []column `json:"added_columns"`
+	DroppedColumns []column `json:"dropped_columns"`
+}
+
+type column struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// assertNATSDelivery checks the live changes reached the JetStream stream.
+func assertNATSDelivery(t *testing.T, ctx context.Context, natsURL string) {
+	t.Helper()
+
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connect nats: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+
+	subject := fmt.Sprintf("%s.public.%s", prefix, table)
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		stream, err := js.Stream(ctx, natsStream)
+		if err == nil {
+			msg, err := stream.GetLastMsgForSubject(ctx, subject)
+			if err == nil {
+				var p payload
+				if err := json.Unmarshal(msg.Data, &p); err != nil {
+					t.Fatalf("nats payload is not JSON: %v", err)
+				}
+				if p.Table != table {
+					t.Errorf("nats payload table = %q, want %q", p.Table, table)
+				}
+				if p.Operation == "" {
+					t.Errorf("nats payload has no operation: %+v", p)
+				}
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no NATS message on %s within the deadline", subject)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// awaitSchemaStreamEntry polls the schema notification stream until it has an
+// entry, returning the newest one.
+func awaitSchemaStreamEntry(t *testing.T, ctx context.Context, rdb *redis.Client) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		msgs, err := rdb.XRange(ctx, prefix+":schema", "-", "+").Result()
+		if err != nil && err != redis.Nil {
+			t.Fatalf("xrange schema stream: %v", err)
+		}
+		if len(msgs) > 0 {
+			return msgs[len(msgs)-1].Values
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no entries on the schema notification stream")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// awaitSchemaChange polls /api/schema until a change for the table shows up.
+func awaitSchemaChange(t *testing.T, ctx context.Context, baseURL, table string) schemaChange {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		var resp struct {
+			Changes []schemaChange `json:"changes"`
+		}
+		getJSON(t, ctx, baseURL+"/api/schema", &resp)
+		for _, change := range resp.Changes {
+			if change.Schema+"."+change.Table == table {
+				return change
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for a schema change on %s; saw %+v", table, resp.Changes)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

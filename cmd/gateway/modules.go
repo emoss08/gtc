@@ -10,15 +10,18 @@ import (
 	"github.com/emoss08/gtc/internal/adapters/primary/backfill"
 	"github.com/emoss08/gtc/internal/adapters/primary/wal"
 	meilisink "github.com/emoss08/gtc/internal/adapters/secondary/meilisearch"
+	natssink "github.com/emoss08/gtc/internal/adapters/secondary/nats"
 	outboxsink "github.com/emoss08/gtc/internal/adapters/secondary/outbox"
 	redissink "github.com/emoss08/gtc/internal/adapters/secondary/redis"
 	redisjsonsink "github.com/emoss08/gtc/internal/adapters/secondary/redisjson"
+	webhooksink "github.com/emoss08/gtc/internal/adapters/secondary/webhook"
 	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/emoss08/gtc/internal/core/ports"
 	"github.com/emoss08/gtc/internal/core/services"
 	"github.com/emoss08/gtc/internal/infrastructure/config"
 	"github.com/emoss08/gtc/internal/infrastructure/dlq"
 	"github.com/emoss08/gtc/internal/infrastructure/resilience"
+	"github.com/emoss08/gtc/internal/infrastructure/schema"
 	"github.com/emoss08/gtc/internal/infrastructure/server"
 	"github.com/emoss08/gtc/internal/infrastructure/transform"
 	"github.com/emoss08/gtc/ui"
@@ -34,6 +37,8 @@ func Module() fx.Option {
 			config.LoadSinksConfig,
 			newBackfillCoordinator,
 			newDLQManager,
+			newSchemaRecorder,
+			newSchemaObserver,
 			newWALReader,
 			func(r *wal.Reader) ports.WALReader { return r },
 			newSinks,
@@ -107,9 +112,46 @@ func newDLQManager(cfg *config.Config, logger *slog.Logger) (*dlq.Manager, error
 	}), nil
 }
 
+// newSchemaRecorder keeps the in-memory DDL history that /api/schema and the
+// dashboard read.
+func newSchemaRecorder(logger *slog.Logger) *schema.Recorder {
+	return schema.NewRecorder(logger)
+}
+
+// newSchemaObserver fans schema changes to the recorder and, when Redis is
+// configured, to the "<prefix>:schema" notification stream.
+func newSchemaObserver(
+	cfg *config.Config,
+	recorder *schema.Recorder,
+	lc fx.Lifecycle,
+	logger *slog.Logger,
+) (ports.SchemaObserver, error) {
+	observers := schema.Observers{recorder}
+
+	if rc := redissink.LoadConfig(); rc.Enabled && cfg.SchemaEvents {
+		publisher, err := schema.NewRedisPublisher(schema.RedisPublisherParams{
+			URL:    rc.URL,
+			Prefix: rc.StreamPrefix,
+			MaxLen: rc.MaxStreamLen,
+			Logger: logger,
+		})
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("publishing schema changes", slog.String("stream", publisher.Stream()))
+		observers = append(observers, publisher)
+		lc.Append(fx.Hook{
+			OnStop: func(context.Context) error { return publisher.Close() },
+		})
+	}
+
+	return observers, nil
+}
+
 func newWALReader(
 	cfg *config.Config,
 	coordinator *backfill.Coordinator,
+	schemaObserver ports.SchemaObserver,
 	logger *slog.Logger,
 ) *wal.Reader {
 	walCfg := wal.Config{
@@ -121,6 +163,7 @@ func newWALReader(
 		AutoCreatePub:     cfg.AutoCreatePub,
 		SlotRetryInterval: cfg.SlotRetryInterval,
 		SlotRetryTimeout:  cfg.SlotRetryTimeout,
+		SchemaObserver:    schemaObserver,
 	}
 
 	if coordinator != nil {
@@ -250,6 +293,39 @@ func newSinks(
 		}
 	}
 
+	if wc := webhooksink.LoadConfig(); wc.Enabled {
+		// The webhook sink only needs table filtering; its destination is a
+		// single configured URL, not a per-table key.
+		sink := webhooksink.NewSink(webhooksink.SinkParams{
+			Config: wc,
+			Filter: &sinksCfg.Webhook,
+			Logger: logger,
+		})
+		if err := addSink(sink, sinksCfg.Webhook.Transform, sinksCfg.Webhook.TableTransforms()); err != nil {
+			return nil, err
+		}
+	}
+
+	if nc := natssink.LoadConfig(); nc.Enabled {
+		resolver, err := redissink.NewKeyResolver(redissink.KeyResolverParams{
+			Resolver:       &sinksCfg.NATS,
+			Filter:         &sinksCfg.NATS,
+			Prefix:         nc.SubjectPrefix,
+			DefaultPattern: natssink.DefaultSubjectPattern,
+		})
+		if err != nil {
+			return nil, err
+		}
+		sink := natssink.NewSink(natssink.SinkParams{
+			Config:   nc,
+			Resolver: resolver,
+			Logger:   logger,
+		})
+		if err := addSink(sink, sinksCfg.NATS.Transform, sinksCfg.NATS.TableTransforms()); err != nil {
+			return nil, err
+		}
+	}
+
 	if mc := meilisink.LoadConfig(); mc.Enabled {
 		mapper := meilisink.NewTableMapper(meilisink.TableMapperParams{
 			Resolver: &sinksCfg.Meilisearch,
@@ -326,6 +402,7 @@ func newHTTPServer(
 	dlqManager *dlq.Manager,
 	reader *wal.Reader,
 	health *server.HealthStatus,
+	schemaRecorder *schema.Recorder,
 	logger *slog.Logger,
 ) *server.Server {
 	var backfillManager ports.BackfillManager
@@ -343,6 +420,7 @@ func newHTTPServer(
 		Backfill: backfillManager,
 		DLQ:      dlqPort,
 		WAL:      reader,
+		Schema:   schemaRecorder,
 		Info: server.InstanceInfo{
 			Version:     version,
 			SlotName:    cfg.SlotName,

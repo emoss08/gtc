@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GTC is a PostgreSQL Change Data Capture (CDC) platform written in Go. It captures changes directly from PostgreSQL WAL and routes them to configurable sinks (Redis streams, RedisJSON, Meilisearch). Built with hexagonal architecture and Uber FX for dependency injection.
+GTC is a PostgreSQL Change Data Capture (CDC) platform written in Go. It captures changes directly from PostgreSQL WAL and routes them to configurable sinks (Redis streams, RedisJSON, Meilisearch, NATS/JetStream, webhooks). Built with hexagonal architecture and Uber FX for dependency injection.
 
 ## Build, Test, and Run Commands
 
@@ -12,6 +12,7 @@ GTC is a PostgreSQL Change Data Capture (CDC) platform written in Go. It capture
 go build -o gateway ./cmd/gateway
 go test ./...
 go run ./cmd/gateway
+go run ./cmd/gateway doctor   # preflight checks (PG settings, privileges, sinks); exit 1 on failure
 
 # End-to-end test (real PostgreSQL wal_level=logical + Redis; also run in CI):
 GTC_TEST_DATABASE_URL=postgres://... GTC_TEST_REDIS_URL=redis://... \
@@ -58,6 +59,12 @@ Consequences to keep in mind:
   placeholder strings) and listed in `UnchangedToastColumns`. Sinks handle
   this with partial updates (Meilisearch `UpdateDocuments`, RedisJSON
   `JSON.MERGE`).
+- Schema (DDL) changes are detected by diffing pgoutput relation
+  descriptions, which PostgreSQL re-sends before a changed table's next row
+  change. They are **best-effort**, not at-least-once: a reconnect
+  re-describes tables with nothing to diff against, so a missed change cannot
+  be redelivered. Observers must therefore never fail the WAL stream —
+  `ports.SchemaObserver` returns no error by design.
 - Backfill emits `READ` events for existing rows, interleaved with the live
   stream via WAL watermarks (`pg_logical_emit_message`, prefix
   `gtc-backfill`). Chunk rows superseded by live events between the low and
@@ -94,7 +101,8 @@ Consequences to keep in mind:
 | CDC_DLQ_THRESHOLD | 3 | Failure cycles for the same event before it is parked |
 | CDC_DLQ_MAX_ENTRIES | 10000 | DLQ cap; when full, parking fails and the pipeline stalls |
 | CDC_MASK_HMAC_KEY | - | Secret key for the hmac256 mask strategy (startup fails if a transform uses hmac256 without it) |
-| SINK_CONFIG_FILE | - | Path to per-table sink YAML (see config/sinks.example.yaml). Without it, Redis sinks mirror all tables |
+| CDC_SCHEMA_EVENTS | true | Publish detected DDL changes to the <prefix>:schema Redis stream (detection/metrics/API always on) |
+| SINK_CONFIG_FILE | - | Path to per-table sink YAML (see config/sinks.example.yaml). Without it, key-templated sinks mirror all tables |
 | REDIS_URL | - | Redis connection (enables stream sink if set) |
 | REDIS_STREAM_PREFIX | cdc | Stream key prefix |
 | REDIS_MAX_STREAM_LEN | 10000 | Max stream length |
@@ -102,9 +110,24 @@ Consequences to keep in mind:
 | REDIS_JSON_PREFIX | cdc | RedisJSON key prefix |
 | MEILISEARCH_URL | - | Meilisearch URL (enables sink if set) |
 | MEILISEARCH_API_KEY | - | Meilisearch API key |
+| NATS_URL | - | NATS connection (enables NATS sink if set) |
+| NATS_SUBJECT_PREFIX | cdc | Subject prefix: <prefix>.<schema>.<table> |
+| NATS_JETSTREAM | true | Publish via JetStream (acked + deduped by LSN); false = fire-and-forget |
+| NATS_STREAM | GTC | JetStream stream capturing <prefix>.> |
+| NATS_AUTO_CREATE_STREAM | true | Create that stream when missing |
+| NATS_CREDENTIALS / NATS_TOKEN | - | NATS auth |
+| NATS_TIMEOUT | 5s | Connect/publish/flush timeout |
+| WEBHOOK_URL | - | HTTP endpoint (enables webhook sink if set) |
+| WEBHOOK_SIGNING_SECRET | - | HMAC-SHA256 key for the X-GTC-Signature header |
+| WEBHOOK_AUTH_HEADER | - | Sent verbatim as Authorization |
+| WEBHOOK_TIMEOUT | 5s | Per-delivery HTTP timeout |
+| WEBHOOK_MAX_IDLE_CONNS | 10 | Connection pool size |
 
-The Meilisearch sink only indexes tables mapped in `SINK_CONFIG_FILE` under
-`meilisearch.tables`. RedisJSON key patterns should only reference replica
+Key-templated sinks (redis_stream, redis_json, webhook, nats) mirror every
+table when SINK_CONFIG_FILE is unset; with a config file present, each sink
+needs `sync_all: true` or an explicit `tables` map or it delivers nothing
+(`gtc doctor` warns about that case). The Meilisearch sink only indexes
+tables mapped in `SINK_CONFIG_FILE` under `meilisearch.tables`. RedisJSON key patterns should only reference replica
 identity columns (normally the primary key); other columns are absent from
 DELETE events, which would make the delete target the wrong key.
 
@@ -146,6 +169,8 @@ internal/
     transform/         # Declarative per-sink transforms (CEL filters, masking)
     resilience/        # Circuit breaker and retry wrapper for sinks
     dlq/               # Dead-letter queue (Redis store, parking decorator, triage)
+    doctor/            # `gtc doctor` preflight checks
+    schema/            # DDL change history, logging, and Redis notification stream
     server/            # HTTP server: health/readiness/metrics, APIs, dashboard
     metrics/           # Prometheus metrics
 ui/                    # React 19 + Tailwind dashboard; dist/ committed + embedded

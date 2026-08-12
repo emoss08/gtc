@@ -52,6 +52,28 @@ meilisearch:
       mask:
         email: redact
 
+# Webhook: one POST per event to WEBHOOK_URL. Set WEBHOOK_SIGNING_SECRET and
+# verify X-GTC-Signature (HMAC-SHA256 over "<X-GTC-Timestamp>.<body>") on the
+# receiving end. Deliveries carry X-GTC-Event-Id; dedupe on it, since delivery
+# is at-least-once. Only table selection and transforms apply here — the
+# destination is the single configured URL.
+webhook:
+  tables:
+    public.orders:
+      filter: 'new.status == "shipped"'
+    public.users:
+      mask:
+        email: hmac256
+
+# NATS: publishes to <NATS_SUBJECT_PREFIX>.<schema>.<table> by default, or the
+# per-table `key` below. JetStream is used unless NATS_JETSTREAM=false, which
+# makes publishing fire-and-forget. Subjects are sanitized: wildcards and
+# whitespace from identifiers become underscores.
+nats:
+  sync_all: true
+  tables:
+    public.orders: "{{.Prefix}}.orders.{{.Field \"status\"}}"
+
 # Transactional outbox: INSERTs into this table are published as messages to
 # the Redis stream <stream_prefix>:<topic column value>, instead of the table
 # being mirrored like data. The table is automatically excluded from the

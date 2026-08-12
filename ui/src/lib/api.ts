@@ -79,6 +79,41 @@ export const historySchema = z.object({
     .transform((v) => v ?? []),
 });
 
+export const columnDefSchema = z.object({
+  name: z.string(),
+  type: z.string(),
+  type_oid: z.number(),
+  part_of_key: z.boolean(),
+});
+
+export const schemaChangeSchema = z.object({
+  schema: z.string(),
+  table: z.string(),
+  relation_id: z.number(),
+  previous_schema: z.string().optional(),
+  previous_table: z.string().optional(),
+  added_columns: z.array(columnDefSchema).optional(),
+  dropped_columns: z.array(columnDefSchema).optional(),
+  changed_columns: z
+    .array(z.object({ name: z.string(), from: columnDefSchema, to: columnDefSchema }))
+    .optional(),
+  key_columns: z.array(z.string()).optional(),
+  previous_key_columns: z.array(z.string()).optional(),
+  replica_identity: z.string(),
+  previous_replica_identity: z.string().optional(),
+  kinds: z.array(z.string()),
+  lsn: z.string(),
+  transaction_id: z.number(),
+  timestamp: z.string(),
+  breaking: z.boolean(),
+  summary: z.string(),
+});
+
+export const schemaListSchema = z.object({
+  total: z.number(),
+  changes: z.array(schemaChangeSchema).nullable().transform((v) => v ?? []),
+});
+
 export const dlqEntrySchema = z.object({
   id: z.string(),
   sink: z.string(),
@@ -105,6 +140,8 @@ export type HistorySample = History['samples'][number];
 export type SinkStats = z.infer<typeof sinkStatsSchema>;
 export type TableStats = z.infer<typeof tableStatsSchema>;
 export type BackfillStatus = z.infer<typeof backfillStatusSchema>;
+export type SchemaChange = z.infer<typeof schemaChangeSchema>;
+export type ColumnDef = z.infer<typeof columnDefSchema>;
 export type DlqEntry = z.infer<typeof dlqEntrySchema>;
 export type DlqList = z.infer<typeof dlqListSchema>;
 
@@ -124,6 +161,9 @@ export const getStats = async (): Promise<Stats> => statsSchema.parse(await requ
 
 export const getHistory = async (): Promise<History> =>
   historySchema.parse(await request('/api/history'));
+
+export const getSchemaChanges = async (): Promise<z.infer<typeof schemaListSchema>> =>
+  schemaListSchema.parse(await request('/api/schema'));
 
 export const getDlq = async (limit = 100): Promise<DlqList> =>
   dlqListSchema.parse(await request(`/dlq?limit=${limit}`));

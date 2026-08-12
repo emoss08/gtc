@@ -9,6 +9,7 @@ import {
   Moon,
   Sun,
   Table2,
+  FileCode2,
   Zap,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
@@ -16,11 +17,12 @@ import { cn } from '@/lib/utils';
 import { formatDuration } from '@/lib/format';
 import type { Stats } from '@/lib/api';
 
-export type Page = 'overview' | 'tables' | 'backfill' | 'dlq';
+export type Page = 'overview' | 'tables' | 'schema' | 'backfill' | 'dlq';
 
 const NAV: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
   { id: 'tables', label: 'Tables', icon: Table2 },
+  { id: 'schema', label: 'Schema', icon: FileCode2 },
   { id: 'backfill', label: 'Backfill', icon: DatabaseBackup },
   { id: 'dlq', label: 'Dead letters', icon: Inbox },
 ];

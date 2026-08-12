@@ -145,4 +145,22 @@ var (
 		},
 		[]string{"sink", "status"},
 	)
+
+	SchemaChangesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "cdc",
+			Name:      "schema_changes_total",
+			Help:      "Detected DDL changes on published tables, by kind",
+		},
+		[]string{"schema", "table", "kind"},
+	)
+
+	SchemaPublishErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "cdc",
+			Name:      "schema_publish_errors_total",
+			Help:      "Failures publishing a schema-change notification",
+		},
+		[]string{"target"},
+	)
 )
