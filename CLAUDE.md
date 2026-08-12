@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GTC is a PostgreSQL Change Data Capture (CDC) platform written in Go. It captures changes directly from PostgreSQL WAL and routes them to configurable sinks (Redis streams, RedisJSON, Meilisearch, NATS/JetStream, webhooks). Built with hexagonal architecture and Uber FX for dependency injection.
+GTC is a PostgreSQL Change Data Capture (CDC) platform written in Go. It captures changes directly from PostgreSQL WAL and routes them to configurable sinks (Redis streams, RedisJSON, Meilisearch, NATS/JetStream, webhooks, ClickHouse). Built with hexagonal architecture and Uber FX for dependency injection.
 
 ## Build, Test, and Run Commands
 
@@ -65,6 +65,13 @@ Consequences to keep in mind:
   re-describes tables with nothing to diff against, so a missed change cannot
   be redelivered. Observers must therefore never fail the WAL stream —
   `ports.SchemaObserver` returns no error by design.
+- The ClickHouse sink mirrors each table as
+  ReplacingMergeTree(_version, _deleted) keyed by the source primary key,
+  versioned by LSN. It introspects the source catalog for column types (CDC
+  events carry values, not types), carries unchanged TOAST columns forward by
+  reading the stored row, and implements ports.SchemaObserver so an upstream
+  ADD COLUMN reaches the mirror. Tables without a primary key are skipped
+  with an error rather than mirrored wrongly.
 - Backfill emits `READ` events for existing rows, interleaved with the live
   stream via WAL watermarks (`pg_logical_emit_message`, prefix
   `gtc-backfill`). Chunk rows superseded by live events between the low and
@@ -122,6 +129,13 @@ Consequences to keep in mind:
 | WEBHOOK_AUTH_HEADER | - | Sent verbatim as Authorization |
 | WEBHOOK_TIMEOUT | 5s | Per-delivery HTTP timeout |
 | WEBHOOK_MAX_IDLE_CONNS | 10 | Connection pool size |
+| CLICKHOUSE_URL | - | ClickHouse DSN (enables the analytics mirror if set) |
+| CLICKHOUSE_DATABASE | gtc | Database holding mirrored tables |
+| CLICKHOUSE_TABLE_PREFIX | - | Prefix for generated table names |
+| CLICKHOUSE_AUTO_CREATE_TABLES | true | Create/extend target tables from the source schema |
+| CLICKHOUSE_ASYNC_INSERT | true | Server-side batching of the stream's small inserts |
+| CLICKHOUSE_WAIT_FOR_INSERT | true | Wait for the flush; false weakens at-least-once |
+| CLICKHOUSE_TIMEOUT | 10s | Connect/insert/query timeout |
 
 Key-templated sinks (redis_stream, redis_json, webhook, nats) mirror every
 table when SINK_CONFIG_FILE is unset; with a config file present, each sink

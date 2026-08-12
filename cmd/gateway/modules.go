@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/url"
 	"sync"
 	"time"
 
 	"github.com/emoss08/gtc/internal/adapters/primary/backfill"
 	"github.com/emoss08/gtc/internal/adapters/primary/wal"
+	clickhousesink "github.com/emoss08/gtc/internal/adapters/secondary/clickhouse"
 	meilisink "github.com/emoss08/gtc/internal/adapters/secondary/meilisearch"
 	natssink "github.com/emoss08/gtc/internal/adapters/secondary/nats"
 	outboxsink "github.com/emoss08/gtc/internal/adapters/secondary/outbox"
@@ -37,6 +39,7 @@ func Module() fx.Option {
 			config.LoadSinksConfig,
 			newBackfillCoordinator,
 			newDLQManager,
+			newClickHouseSink,
 			newSchemaRecorder,
 			newSchemaObserver,
 			newWALReader,
@@ -112,6 +115,54 @@ func newDLQManager(cfg *config.Config, logger *slog.Logger) (*dlq.Manager, error
 	}), nil
 }
 
+// newClickHouseSink returns nil when CLICKHOUSE_URL is unset. It is its own
+// provider because the sink is both a domain.Sink and a schema observer: an
+// upstream ALTER has to reach the mirror's DDL.
+func newClickHouseSink(
+	cfg *config.Config,
+	sinksCfg *config.SinksConfig,
+	lc fx.Lifecycle,
+	logger *slog.Logger,
+) (*clickhousesink.Sink, error) {
+	cc := clickhousesink.LoadConfig()
+	if !cc.Enabled {
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Column types come from the source catalog, so the sink needs an
+	// ordinary (non-replication) connection of its own.
+	introspector, err := clickhousesink.NewIntrospector(ctx, plainDatabaseURL(cfg.DatabaseURL))
+	if err != nil {
+		return nil, err
+	}
+	lc.Append(fx.Hook{
+		OnStop: func(ctx context.Context) error { return introspector.Close(ctx) },
+	})
+
+	return clickhousesink.NewSink(clickhousesink.SinkParams{
+		Config:       cc,
+		Resolver:     &sinksCfg.ClickHouse,
+		Introspector: introspector,
+		Logger:       logger,
+	}), nil
+}
+
+// plainDatabaseURL strips replication=database: catalog queries need a
+// regular session, not a walsender one.
+func plainDatabaseURL(databaseURL string) string {
+	u, err := url.Parse(databaseURL)
+	if err != nil {
+		return databaseURL
+	}
+	q := u.Query()
+	q.Del("replication")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 // newSchemaRecorder keeps the in-memory DDL history that /api/schema and the
 // dashboard read.
 func newSchemaRecorder(logger *slog.Logger) *schema.Recorder {
@@ -123,10 +174,16 @@ func newSchemaRecorder(logger *slog.Logger) *schema.Recorder {
 func newSchemaObserver(
 	cfg *config.Config,
 	recorder *schema.Recorder,
+	clickhouseSink *clickhousesink.Sink,
 	lc fx.Lifecycle,
 	logger *slog.Logger,
 ) (ports.SchemaObserver, error) {
 	observers := schema.Observers{recorder}
+
+	// Keep the analytics mirror's columns in step with upstream DDL.
+	if clickhouseSink != nil {
+		observers = append(observers, clickhouseSink)
+	}
 
 	if rc := redissink.LoadConfig(); rc.Enabled && cfg.SchemaEvents {
 		publisher, err := schema.NewRedisPublisher(schema.RedisPublisherParams{
@@ -198,6 +255,7 @@ func newSinks(
 	cfg *config.Config,
 	sinksCfg *config.SinksConfig,
 	dlqManager *dlq.Manager,
+	clickhouseSink *clickhousesink.Sink,
 	logger *slog.Logger,
 ) ([]domain.Sink, error) {
 	resCfg := resilience.ResilienceConfig{
@@ -302,6 +360,14 @@ func newSinks(
 			Logger: logger,
 		})
 		if err := addSink(sink, sinksCfg.Webhook.Transform, sinksCfg.Webhook.TableTransforms()); err != nil {
+			return nil, err
+		}
+	}
+
+	// Built by its own provider, because it doubles as a schema observer.
+	if clickhouseSink != nil {
+		if err := addSink(clickhouseSink,
+			sinksCfg.ClickHouse.Transform, sinksCfg.ClickHouse.TableTransforms()); err != nil {
 			return nil, err
 		}
 	}

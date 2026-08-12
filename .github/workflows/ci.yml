@@ -69,24 +69,34 @@ jobs:
 
       # Plain `docker run` instead of job services: services can't override
       # the container command, and Postgres needs -c wal_level=logical.
-      - name: Start PostgreSQL (wal_level=logical) and Redis
+      - name: Start PostgreSQL (wal_level=logical), Redis, NATS and ClickHouse
         run: |
           docker run -d --name pg -p 5432:5432 \
             -e POSTGRES_PASSWORD=postgres \
             postgres:16 -c wal_level=logical
           docker run -d --name redis -p 6379:6379 redis:7
           docker run -d --name nats -p 4222:4222 nats:2 -js
+          docker run -d --name clickhouse -p 9000:9000 \
+            -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:24
           for i in $(seq 1 30); do
             if docker exec pg pg_isready -U postgres -q; then break; fi
             sleep 1
           done
           docker exec pg pg_isready -U postgres
+          # ClickHouse takes a few seconds to accept connections; the sink
+          # fails startup if it is not up when the gateway boots.
+          for i in $(seq 1 60); do
+            if docker exec clickhouse clickhouse-client --query "SELECT 1" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker exec clickhouse clickhouse-client --query "SELECT version()"
 
       - name: Run integration tests
         env:
           GTC_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
           GTC_TEST_REDIS_URL: redis://localhost:6379
           GTC_TEST_NATS_URL: nats://localhost:4222
+          GTC_TEST_CLICKHOUSE_URL: clickhouse://default@localhost:9000/default
         run: go test -tags integration -v -timeout 5m ./test/integration
 
       - name: Dump service logs on failure
@@ -95,6 +105,7 @@ jobs:
           docker logs pg || true
           docker logs redis || true
           docker logs nats || true
+          docker logs clickhouse || true
 
   cross-compile:
     name: Cross-compile all targets

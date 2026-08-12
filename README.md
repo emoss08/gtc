@@ -18,6 +18,7 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
                                        ├──▶ RedisJSON       (document mirror / cache)
                                        ├──▶ Meilisearch     (search index)
                                        ├──▶ NATS JetStream  (durable pub/sub)
+                                       ├──▶ ClickHouse      (analytics mirror)
                                        └──▶ Webhooks        (any HTTP endpoint)
 ```
 
@@ -40,8 +41,9 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
   RedisJSON (one JSON document per row, partial merges on update),
   Meilisearch (partial document updates, waits for task completion so
   indexing failures surface as errors), NATS JetStream (acknowledged,
-  server-side deduplicated publishes), and webhooks (a signed POST per event
-  to any HTTP endpoint). Every sink is independently filtered, transformed,
+  server-side deduplicated publishes), ClickHouse (an analytics mirror whose
+  tables are created — and extended on upstream `ALTER` — from the source
+  schema), and webhooks (a signed POST per event to any HTTP endpoint). Every sink is independently filtered, transformed,
   retried and circuit-broken.
 - **Correct TOAST handling** — unchanged TOAST columns are omitted and
   reported, not replaced with placeholder garbage; sinks merge instead of
@@ -257,6 +259,13 @@ lives in an optional YAML file.
 | `WEBHOOK_AUTH_HEADER` | – | Sent verbatim as the `Authorization` header |
 | `WEBHOOK_TIMEOUT` | `5s` | Per-delivery HTTP timeout |
 | `WEBHOOK_MAX_IDLE_CONNS` | `10` | Connection pool size for the receiver |
+| `CLICKHOUSE_URL` | – | Enables the ClickHouse sink (`clickhouse://user:pass@host:9000/db`) |
+| `CLICKHOUSE_DATABASE` | `gtc` | Database holding the mirrored tables; created when missing |
+| `CLICKHOUSE_TABLE_PREFIX` | – | Prefix for generated table names |
+| `CLICKHOUSE_AUTO_CREATE_TABLES` | `true` | Create and extend target tables from the source schema |
+| `CLICKHOUSE_ASYNC_INSERT` | `true` | Let ClickHouse batch the stream's small inserts |
+| `CLICKHOUSE_WAIT_FOR_INSERT` | `true` | Wait for the batch to flush before reporting success — **turning this off weakens at-least-once** |
+| `CLICKHOUSE_TIMEOUT` | `10s` | Connect, insert and query timeout |
 
 ### Per-table sink routing
 
@@ -440,6 +449,65 @@ nats:
 
 Wildcards and whitespace that PostgreSQL allows in identifiers but NATS
 rejects in subjects (`*`, `>`, spaces) become underscores.
+
+## ClickHouse mirror
+
+```bash
+CLICKHOUSE_URL="clickhouse://default@localhost:9000/default" ./gateway
+```
+
+Each source table becomes a `ReplacingMergeTree` in the `gtc` database,
+created from the source catalog on first sight — no DDL to write:
+
+```sql
+CREATE TABLE gtc.orders (
+    `id` Int32,
+    `total` Nullable(Decimal(10, 2)),
+    `notes` Nullable(String),
+    `_version` UInt64,              -- the event's LSN
+    `_deleted` UInt8 DEFAULT 0,     -- tombstone marker
+    `_synced_at` DateTime64(3) DEFAULT now64(3)
+) ENGINE = ReplacingMergeTree(`_version`, `_deleted`)
+ORDER BY (`id`)
+```
+
+Query current state with `FINAL`, which collapses row versions and hides
+tombstones:
+
+```sql
+SELECT * FROM gtc.orders FINAL WHERE _deleted = 0;
+```
+
+Why it is built this way:
+
+- **Versioned by LSN.** Replays are idempotent (a redelivered event has the
+  same version), and a live change always beats a backfilled one for the same
+  row, so backfill and streaming can interleave safely.
+- **Deletes become tombstones** rather than vanishing, so a delete that
+  arrives out of order cannot resurrect a row.
+- **Unchanged TOAST columns are carried forward.** `ReplacingMergeTree`
+  replaces whole rows, so an update that left a large column untouched would
+  otherwise blank it; GTC reads the stored value back and rewrites it.
+- **Batched inserts, without giving up the guarantee.** A change stream is
+  exactly the many-small-inserts pattern ClickHouse dislikes, so GTC uses
+  server-side async inserts *and waits for the flush*. Setting
+  `CLICKHOUSE_WAIT_FOR_INSERT=false` trades that guarantee for throughput —
+  the WAL position advances past rows still buffered in the server, and
+  `gtc doctor` warns about it.
+- **DDL follows automatically.** A column added upstream is added to the
+  mirror (see [Schema changes](#schema-changes-ddl)). Dropped and retyped
+  columns are logged but left alone: the mirror holds history the source no
+  longer has, and discarding it silently would be worse than a warning.
+
+Type mapping is exact where ClickHouse has an equivalent (`int4`→`Int32`,
+`numeric(10,2)`→`Decimal(10, 2)`, `timestamptz`→`DateTime64(6, 'UTC')`,
+`uuid`→`UUID`) and falls back to `String` where it does not — unconstrained
+`numeric`, arrays, JSON, enums and user-defined types keep their exact
+PostgreSQL text form for a query to cast.
+
+**Tables need a primary key.** Without one there is no `ORDER BY`, so row
+versions cannot be collapsed and deletes cannot address a row; such tables
+are skipped with an error naming them, and the rest keep mirroring.
 
 ## Schema changes (DDL)
 

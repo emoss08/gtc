@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -21,6 +22,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/redis/go-redis/v9"
 
+	clickhousesink "github.com/emoss08/gtc/internal/adapters/secondary/clickhouse"
 	meilisink "github.com/emoss08/gtc/internal/adapters/secondary/meilisearch"
 	natssink "github.com/emoss08/gtc/internal/adapters/secondary/nats"
 	redissink "github.com/emoss08/gtc/internal/adapters/secondary/redis"
@@ -359,6 +361,13 @@ func checkSinks(ctx context.Context, r *report, cfg *config.Config) int {
 		r.add("nats", skip, "not configured (NATS_URL unset)")
 	}
 
+	if cc := clickhousesink.LoadConfig(); cc.Enabled {
+		count++
+		checkClickHouse(ctx, r, cc)
+	} else {
+		r.add("clickhouse", skip, "not configured (CLICKHOUSE_URL unset)")
+	}
+
 	if count == 0 {
 		r.add("sinks", warn, "no sinks configured — GTC will consume WAL but deliver nowhere")
 	}
@@ -470,6 +479,48 @@ func checkNATS(ctx context.Context, r *report, cfg natssink.Config) {
 		conn.ConnectedUrl(), cfg.Stream)
 }
 
+func checkClickHouse(ctx context.Context, r *report, cfg clickhousesink.Config) {
+	opts, err := clickhouse.ParseDSN(cfg.URL)
+	if err != nil {
+		r.add("clickhouse", fail, "invalid CLICKHOUSE_URL: %v", err)
+		return
+	}
+	conn, err := clickhouse.Open(opts)
+	if err != nil {
+		r.add("clickhouse", fail, "%v", err)
+		return
+	}
+	defer conn.Close()
+
+	pingCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
+	if err := conn.Ping(pingCtx); err != nil {
+		r.add("clickhouse", fail, "%v", err)
+		return
+	}
+
+	var version string
+	if err := conn.QueryRow(pingCtx, "SELECT version()").Scan(&version); err != nil {
+		r.add("clickhouse", fail, "SELECT version(): %v", err)
+		return
+	}
+
+	switch {
+	case !cfg.WaitForInsert:
+		r.add("clickhouse", warn,
+			"ClickHouse %s, but CLICKHOUSE_WAIT_FOR_INSERT=false lets the WAL "+
+				"position advance past rows still buffered in the server, so a "+
+				"crash loses them", version)
+	case !cfg.AutoCreateTables:
+		r.add("clickhouse", warn,
+			"ClickHouse %s, but CLICKHOUSE_AUTO_CREATE_TABLES=false — every "+
+				"mirrored table must already exist with _version/_deleted columns",
+			version)
+	default:
+		r.add("clickhouse", pass, "ClickHouse %s (database %q)", version, cfg.Database)
+	}
+}
+
 type discardLogger struct{}
 
 func (discardLogger) Printf(context.Context, string, ...any) {}
@@ -490,6 +541,9 @@ func checkTableSelection(r *report, sinksCfg *config.SinksConfig) {
 	}
 	if natssink.LoadConfig().Enabled {
 		enabled["nats"] = &sinksCfg.NATS
+	}
+	if clickhousesink.LoadConfig().Enabled {
+		enabled["clickhouse"] = &sinksCfg.ClickHouse
 	}
 
 	var silent []string

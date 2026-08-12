@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -37,13 +38,14 @@ import (
 )
 
 const (
-	slotName    = "gtc_it_slot"
-	publication = "gtc_it_publication"
-	prefix      = "gtcit"
-	table       = "gtc_it_users"
-	stateTable  = "gtc_it_backfill_state"
-	natsStream  = "GTC_IT"
-	stream      = prefix + ":public:" + table
+	slotName     = "gtc_it_slot"
+	publication  = "gtc_it_publication"
+	prefix       = "gtcit"
+	table        = "gtc_it_users"
+	stateTable   = "gtc_it_backfill_state"
+	natsStream   = "GTC_IT"
+	clickhouseDB = "gtc_it"
+	stream       = prefix + ":public:" + table
 )
 
 // webhookReceiver is a real HTTP endpoint the gateway subprocess delivers to.
@@ -163,7 +165,8 @@ func TestEndToEnd(t *testing.T) {
 
 	hook := startWebhookReceiver(t)
 	natsURL := os.Getenv("GTC_TEST_NATS_URL")
-	gw := startGateway(t, ctx, bin, dbURL, redisURL, hook.server.URL, natsURL)
+	clickhouseURL := os.Getenv("GTC_TEST_CLICKHOUSE_URL")
+	gw := startGateway(t, ctx, bin, dbURL, redisURL, hook.server.URL, natsURL, clickhouseURL)
 
 	// Backfill: three READ events, one per pre-existing row.
 	events := awaitEvents(t, ctx, rdb, func(seen []payload) bool {
@@ -271,6 +274,13 @@ func TestEndToEnd(t *testing.T) {
 		t.Errorf("schema entry breaking = %v, want true", got)
 	}
 
+	// The ClickHouse mirror reflects the same rows, with the DDL applied.
+	if clickhouseURL != "" {
+		assertClickHouseMirror(t, ctx, clickhouseURL)
+	} else {
+		t.Log("GTC_TEST_CLICKHOUSE_URL unset; skipping ClickHouse sink assertions")
+	}
+
 	// The dashboard's stats endpoint sees the same pipeline.
 	var stats struct {
 		Streaming   bool    `json:"streaming"`
@@ -332,7 +342,7 @@ func runDoctor(t *testing.T, ctx context.Context, bin, dbURL, redisURL string, w
 func startGateway(
 	t *testing.T,
 	ctx context.Context,
-	bin, dbURL, redisURL, webhookURL, natsURL string,
+	bin, dbURL, redisURL, webhookURL, natsURL, clickhouseURL string,
 ) *gateway {
 	t.Helper()
 
@@ -367,6 +377,8 @@ func startGateway(
 		"NATS_URL="+natsURL,
 		"NATS_SUBJECT_PREFIX="+prefix,
 		"NATS_STREAM="+natsStream,
+		"CLICKHOUSE_URL="+clickhouseURL,
+		"CLICKHOUSE_DATABASE="+clickhouseDB,
 		"LOG_LEVEL=DEBUG",
 	)
 	if err := cmd.Start(); err != nil {
@@ -485,6 +497,54 @@ type schemaChange struct {
 type column struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
+}
+
+// assertClickHouseMirror checks the analytics mirror: the surviving rows are
+// present, the deleted one is gone, and the column added by the DDL above
+// reached the target table.
+func assertClickHouseMirror(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+
+	opts, err := clickhouse.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("parse clickhouse dsn: %v", err)
+	}
+	conn, err := clickhouse.Open(opts)
+	if err != nil {
+		t.Fatalf("open clickhouse: %v", err)
+	}
+	defer conn.Close()
+
+	target := fmt.Sprintf("`%s`.`%s`", clickhouseDB, table)
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		// Rows 1-3 were backfilled, 4 was inserted then deleted, 5 arrived
+		// after the DDL — so five keys, one of them a tombstone.
+		var live, tombstones uint64
+		liveErr := conn.QueryRow(ctx, fmt.Sprintf(
+			"SELECT count() FROM %s FINAL WHERE _deleted = 0", target)).Scan(&live)
+		deletedErr := conn.QueryRow(ctx, fmt.Sprintf(
+			"SELECT count() FROM %s WHERE _deleted = 1", target)).Scan(&tombstones)
+
+		if liveErr == nil && deletedErr == nil && live == 4 && tombstones >= 1 {
+			// The column added upstream must exist on the mirror, carrying
+			// the value written after the ALTER.
+			var nickname string
+			if err := conn.QueryRow(ctx, fmt.Sprintf(
+				"SELECT nickname FROM %s FINAL WHERE id = 5", target)).Scan(&nickname); err != nil {
+				t.Fatalf("added column missing from the mirror: %v", err)
+			}
+			if nickname != "amazing grace" {
+				t.Errorf("mirrored nickname = %q, want %q", nickname, "amazing grace")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("clickhouse mirror never settled: live=%d (want 4) tombstones=%d "+
+				"(liveErr=%v deletedErr=%v)", live, tombstones, liveErr, deletedErr)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // assertNATSDelivery checks the live changes reached the JetStream stream.

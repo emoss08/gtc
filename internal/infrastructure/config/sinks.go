@@ -13,6 +13,7 @@ type SinksConfig struct {
 	Meilisearch MeilisearchSinkConfig `yaml:"meilisearch"`
 	Webhook     KeyedSinkConfig       `yaml:"webhook"`
 	NATS        KeyedSinkConfig       `yaml:"nats"`
+	ClickHouse  KeyedSinkConfig       `yaml:"clickhouse"`
 	Outbox      OutboxConfig          `yaml:"outbox"`
 }
 
@@ -223,7 +224,7 @@ func LoadSinksConfig() (*SinksConfig, error) {
 	// file to narrow it down (the plug-and-play default); Meilisearch is the
 	// exception, since an index must be named per table.
 	keyed := []*KeyedSinkConfig{
-		&cfg.RedisStream, &cfg.RedisJSON, &cfg.Webhook, &cfg.NATS,
+		&cfg.RedisStream, &cfg.RedisJSON, &cfg.Webhook, &cfg.NATS, &cfg.ClickHouse,
 	}
 	for _, sink := range keyed {
 		if sink.Tables == nil {
