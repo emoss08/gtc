@@ -10,9 +10,11 @@ import (
 	"github.com/emoss08/gtc/internal/adapters/primary/backfill"
 	"github.com/emoss08/gtc/internal/adapters/primary/wal"
 	meilisink "github.com/emoss08/gtc/internal/adapters/secondary/meilisearch"
+	natssink "github.com/emoss08/gtc/internal/adapters/secondary/nats"
 	outboxsink "github.com/emoss08/gtc/internal/adapters/secondary/outbox"
 	redissink "github.com/emoss08/gtc/internal/adapters/secondary/redis"
 	redisjsonsink "github.com/emoss08/gtc/internal/adapters/secondary/redisjson"
+	webhooksink "github.com/emoss08/gtc/internal/adapters/secondary/webhook"
 	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/emoss08/gtc/internal/core/ports"
 	"github.com/emoss08/gtc/internal/core/services"
@@ -287,6 +289,39 @@ func newSinks(
 			return nil, err
 		}
 		if err := addSink(sink, sinksCfg.RedisJSON.Transform, sinksCfg.RedisJSON.TableTransforms()); err != nil {
+			return nil, err
+		}
+	}
+
+	if wc := webhooksink.LoadConfig(); wc.Enabled {
+		// The webhook sink only needs table filtering; its destination is a
+		// single configured URL, not a per-table key.
+		sink := webhooksink.NewSink(webhooksink.SinkParams{
+			Config: wc,
+			Filter: &sinksCfg.Webhook,
+			Logger: logger,
+		})
+		if err := addSink(sink, sinksCfg.Webhook.Transform, sinksCfg.Webhook.TableTransforms()); err != nil {
+			return nil, err
+		}
+	}
+
+	if nc := natssink.LoadConfig(); nc.Enabled {
+		resolver, err := redissink.NewKeyResolver(redissink.KeyResolverParams{
+			Resolver:       &sinksCfg.NATS,
+			Filter:         &sinksCfg.NATS,
+			Prefix:         nc.SubjectPrefix,
+			DefaultPattern: natssink.DefaultSubjectPattern,
+		})
+		if err != nil {
+			return nil, err
+		}
+		sink := natssink.NewSink(natssink.SinkParams{
+			Config:   nc,
+			Resolver: resolver,
+			Logger:   logger,
+		})
+		if err := addSink(sink, sinksCfg.NATS.Transform, sinksCfg.NATS.TableTransforms()); err != nil {
 			return nil, err
 		}
 	}

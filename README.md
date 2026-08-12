@@ -16,7 +16,9 @@ streaming platform to get there.
 ```
 PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (event bus)
                                        ├──▶ RedisJSON       (document mirror / cache)
-                                       └──▶ Meilisearch     (search index)
+                                       ├──▶ Meilisearch     (search index)
+                                       ├──▶ NATS JetStream  (durable pub/sub)
+                                       └──▶ Webhooks        (any HTTP endpoint)
 ```
 
 ## Features
@@ -35,9 +37,12 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
   only at transaction commit boundaries, after every sink has processed every
   event. A failed sink means teardown and replay, never silent loss.
 - **Sinks built in** — Redis Streams (fan-out event bus with `XADD`),
-  RedisJSON (one JSON document per row, partial merges on update), and
+  RedisJSON (one JSON document per row, partial merges on update),
   Meilisearch (partial document updates, waits for task completion so
-  indexing failures surface as errors).
+  indexing failures surface as errors), NATS JetStream (acknowledged,
+  server-side deduplicated publishes), and webhooks (a signed POST per event
+  to any HTTP endpoint). Every sink is independently filtered, transformed,
+  retried and circuit-broken.
 - **Correct TOAST handling** — unchanged TOAST columns are omitted and
   reported, not replaced with placeholder garbage; sinks merge instead of
   clobbering.
@@ -239,6 +244,19 @@ lives in an optional YAML file.
 | `REDIS_JSON_PREFIX` | `cdc` | RedisJSON key prefix |
 | `MEILISEARCH_URL` | – | Enables the Meilisearch sink |
 | `MEILISEARCH_API_KEY` | – | Meilisearch API key |
+| `NATS_URL` | – | Enables the NATS sink (`nats://host:4222`; comma-separated for a cluster) |
+| `NATS_SUBJECT_PREFIX` | `cdc` | Subject prefix: `<prefix>.<schema>.<table>` |
+| `NATS_JETSTREAM` | `true` | Publish through JetStream (acknowledged + deduplicated). `false` is fire-and-forget |
+| `NATS_STREAM` | `GTC` | JetStream stream capturing `<prefix>.>` |
+| `NATS_AUTO_CREATE_STREAM` | `true` | Create that stream when missing |
+| `NATS_CREDENTIALS` | – | Path to a NATS `.creds` file |
+| `NATS_TOKEN` | – | NATS auth token |
+| `NATS_TIMEOUT` | `5s` | Connect, publish and flush timeout |
+| `WEBHOOK_URL` | – | Enables the webhook sink; receives one POST per event |
+| `WEBHOOK_SIGNING_SECRET` | – | HMAC-SHA256 key for `X-GTC-Signature` (strongly recommended) |
+| `WEBHOOK_AUTH_HEADER` | – | Sent verbatim as the `Authorization` header |
+| `WEBHOOK_TIMEOUT` | `5s` | Per-delivery HTTP timeout |
+| `WEBHOOK_MAX_IDLE_CONNS` | `10` | Connection pool size for the receiver |
 
 ### Per-table sink routing
 
@@ -355,6 +373,73 @@ Behavior worth knowing:
   out, so it never blocks the pipeline).
 - Delivery is at-least-once like everything else; consumers dedupe by the
   `id` field.
+
+## Webhook and NATS sinks
+
+Both are enabled the same way as every other sink — set a URL — and both
+respect per-table filtering and transforms from `SINK_CONFIG_FILE`.
+
+### Webhook
+
+```bash
+WEBHOOK_URL="https://example.com/hooks/gtc" \
+WEBHOOK_SIGNING_SECRET="$(openssl rand -hex 32)" ./gateway
+```
+
+Each event is one `POST` with the same JSON body the Redis stream carries,
+plus headers:
+
+| Header | Purpose |
+|--------|---------|
+| `X-GTC-Event-Id` | The event's LSN — **dedupe on this**, delivery is at-least-once |
+| `X-GTC-Table` | `schema.table`, for cheap routing without parsing the body |
+| `X-GTC-Operation` | `INSERT`/`UPDATE`/`DELETE`/`READ`/`TRUNCATE` |
+| `X-GTC-Timestamp` | Unix seconds, signed alongside the body |
+| `X-GTC-Signature` | `sha256=<hex>` — HMAC-SHA256 over `"<timestamp>.<body>"` |
+
+Verify a delivery (Go):
+
+```go
+mac := hmac.New(sha256.New, []byte(secret))
+mac.Write([]byte(r.Header.Get("X-GTC-Timestamp") + "."))
+mac.Write(body)
+ok := hmac.Equal([]byte(r.Header.Get("X-GTC-Signature")),
+    []byte("sha256="+hex.EncodeToString(mac.Sum(nil))))
+```
+
+Any 2xx is success. Anything else — or a timeout — fails the event, so it is
+retried and eventually dead-lettered rather than silently lost, and the WAL
+position does not advance past it. Because the receiver is in the replication
+path, keep it fast: `WEBHOOK_TIMEOUT` defaults to 5s and sink-count × timeout
+must stay under `wal_sender_timeout` (`gtc doctor` checks this).
+
+### NATS
+
+```bash
+NATS_URL="nats://localhost:4222" ./gateway
+```
+
+Events publish to `<NATS_SUBJECT_PREFIX>.<schema>.<table>`, and the stream
+capturing `<prefix>.>` is created automatically. JetStream is the default
+because it acknowledges each publish — a delivery is only counted once the
+server has persisted it — and because publishing with the event's LSN as the
+message ID lets **JetStream collapse the duplicates** that at-least-once
+redelivery produces. Setting `NATS_JETSTREAM=false` falls back to core NATS,
+which is fire-and-forget: events vanish when nobody is subscribed, so
+`gtc doctor` warns about it.
+
+Subjects come from the same template engine as Redis keys, so a table can be
+routed by column value:
+
+```yaml
+nats:
+  sync_all: true
+  tables:
+    public.orders: "{{.Prefix}}.orders.{{.Field \"status\"}}"
+```
+
+Wildcards and whitespace that PostgreSQL allows in identifiers but NATS
+rejects in subjects (`*`, `>`, spaces) become underscores.
 
 ## Schema changes (DDL)
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,11 +17,15 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/meilisearch/meilisearch-go"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/redis/go-redis/v9"
 
 	meilisink "github.com/emoss08/gtc/internal/adapters/secondary/meilisearch"
+	natssink "github.com/emoss08/gtc/internal/adapters/secondary/nats"
 	redissink "github.com/emoss08/gtc/internal/adapters/secondary/redis"
 	redisjsonsink "github.com/emoss08/gtc/internal/adapters/secondary/redisjson"
+	webhooksink "github.com/emoss08/gtc/internal/adapters/secondary/webhook"
 	"github.com/emoss08/gtc/internal/infrastructure/config"
 	"github.com/emoss08/gtc/internal/infrastructure/transform"
 )
@@ -309,6 +314,7 @@ func checkSinks(ctx context.Context, r *report, cfg *config.Config) int {
 		sinksCfg = nil
 	} else if sinksCfg != nil && cfg != nil {
 		checkTransforms(r, cfg, sinksCfg)
+		checkTableSelection(r, sinksCfg)
 	}
 
 	count := 0
@@ -337,6 +343,20 @@ func checkSinks(ctx context.Context, r *report, cfg *config.Config) int {
 		}
 	} else {
 		r.add("meilisearch", skip, "not configured (MEILISEARCH_URL unset)")
+	}
+
+	if wc := webhooksink.LoadConfig(); wc.Enabled {
+		count++
+		checkWebhook(r, wc)
+	} else {
+		r.add("webhook", skip, "not configured (WEBHOOK_URL unset)")
+	}
+
+	if nc := natssink.LoadConfig(); nc.Enabled {
+		count++
+		checkNATS(ctx, r, nc)
+	} else {
+		r.add("nats", skip, "not configured (NATS_URL unset)")
 	}
 
 	if count == 0 {
@@ -383,9 +403,110 @@ func checkRedis(ctx context.Context, r *report, name, rawURL string, needJSON bo
 	r.add(name, pass, "PONG from %s", opts.Addr)
 }
 
+// checkWebhook validates configuration without sending a request: probing
+// would deliver traffic the receiver never asked for.
+func checkWebhook(r *report, cfg webhooksink.Config) {
+	u, err := url.Parse(cfg.URL)
+	if err != nil || u.Host == "" {
+		r.add("webhook", fail, "invalid WEBHOOK_URL %q", cfg.URL)
+		return
+	}
+	switch {
+	case u.Scheme != "http" && u.Scheme != "https":
+		r.add("webhook", fail, "WEBHOOK_URL scheme %q must be http or https", u.Scheme)
+	case u.Scheme == "http" && cfg.SigningSecret == "":
+		r.add("webhook", warn,
+			"%s is plain HTTP and unsigned — events (and any unmasked column) "+
+				"travel in the clear and the receiver cannot verify them; "+
+				"use https or set WEBHOOK_SIGNING_SECRET", cfg.URL)
+	case cfg.SigningSecret == "":
+		r.add("webhook", warn,
+			"%s is not signed — set WEBHOOK_SIGNING_SECRET so the receiver "+
+				"can verify deliveries came from GTC", cfg.URL)
+	default:
+		r.add("webhook", pass, "%s (signed; endpoint is not probed)", cfg.URL)
+	}
+}
+
+func checkNATS(ctx context.Context, r *report, cfg natssink.Config) {
+	opts := []nats.Option{nats.Name("gtc-doctor"), nats.Timeout(cfg.Timeout)}
+	if cfg.Credentials != "" {
+		opts = append(opts, nats.UserCredentials(cfg.Credentials))
+	}
+	if cfg.Token != "" {
+		opts = append(opts, nats.Token(cfg.Token))
+	}
+
+	conn, err := nats.Connect(cfg.URL, opts...)
+	if err != nil {
+		r.add("nats", fail, "%v", err)
+		return
+	}
+	defer conn.Close()
+
+	if !cfg.JetStream {
+		r.add("nats", warn,
+			"connected to %s, but NATS_JETSTREAM=false publishes fire-and-forget: "+
+				"events are dropped when no subscriber is listening",
+			conn.ConnectedUrl())
+		return
+	}
+
+	js, err := jetstream.New(conn)
+	if err != nil {
+		r.add("nats", fail, "JetStream unavailable: %v", err)
+		return
+	}
+	jsCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
+	if _, err := js.AccountInfo(jsCtx); err != nil {
+		r.add("nats", fail,
+			"JetStream is not enabled on %s (start the server with -js, or set "+
+				"NATS_JETSTREAM=false to accept fire-and-forget delivery): %v",
+			conn.ConnectedUrl(), err)
+		return
+	}
+	r.add("nats", pass, "JetStream ready at %s (stream %q)",
+		conn.ConnectedUrl(), cfg.Stream)
+}
+
 type discardLogger struct{}
 
 func (discardLogger) Printf(context.Context, string, ...any) {}
+
+// checkTableSelection catches a sink that is enabled but selects no tables:
+// with a sink config file present, sync_all defaults to false, so a sink can
+// be fully configured and still silently deliver nothing.
+func checkTableSelection(r *report, sinksCfg *config.SinksConfig) {
+	enabled := map[string]*config.KeyedSinkConfig{}
+	if redissink.LoadConfig().Enabled {
+		enabled["redis_stream"] = &sinksCfg.RedisStream
+	}
+	if redisjsonsink.LoadConfig().Enabled {
+		enabled["redis_json"] = &sinksCfg.RedisJSON
+	}
+	if webhooksink.LoadConfig().Enabled {
+		enabled["webhook"] = &sinksCfg.Webhook
+	}
+	if natssink.LoadConfig().Enabled {
+		enabled["nats"] = &sinksCfg.NATS
+	}
+
+	var silent []string
+	for name, sink := range enabled {
+		if !sink.SyncAll && len(sink.Tables) == 0 {
+			silent = append(silent, name)
+		}
+	}
+	if len(silent) == 0 {
+		return
+	}
+	sort.Strings(silent)
+	r.add("table selection", warn,
+		"%s enabled but selecting no tables — add a `%s:` section with "+
+			"sync_all: true or a tables map, or it will deliver nothing",
+		strings.Join(silent, ", "), silent[0])
+}
 
 // checkTransforms compiles every transform spec exactly as startup would.
 func checkTransforms(r *report, cfg *config.Config, sinksCfg *config.SinksConfig) {
