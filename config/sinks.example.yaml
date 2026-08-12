@@ -74,6 +74,17 @@ nats:
   tables:
     public.orders: "{{.Prefix}}.orders.{{.Field \"status\"}}"
 
+# ClickHouse: each table becomes a ReplacingMergeTree(_version, _deleted)
+# keyed by the source primary key, created automatically from the source
+# schema. Query current state with FINAL (tombstones are excluded):
+#   SELECT * FROM gtc.orders FINAL WHERE _deleted = 0
+# The per-table value below overrides the generated target table name.
+# Tables without a primary key cannot be mirrored and are reported at startup.
+clickhouse:
+  sync_all: true
+  tables:
+    public.orders: orders_mirror
+
 # Transactional outbox: INSERTs into this table are published as messages to
 # the Redis stream <stream_prefix>:<topic column value>, instead of the table
 # being mirrored like data. The table is automatically excluded from the
