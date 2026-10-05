@@ -2,8 +2,11 @@ package meilisearch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"slices"
 	"time"
 
 	"github.com/emoss08/gtc/internal/core/domain"
@@ -50,6 +53,10 @@ func (s *Sink) Initialize(ctx context.Context) error {
 		return err
 	}
 
+	if err := s.applyIndexSettings(ctx); err != nil {
+		return err
+	}
+
 	s.logger.Info("meilisearch sink initialized")
 	return nil
 }
@@ -65,6 +72,8 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 	}
 
 	index := s.client.Index(indexName)
+	primaryKey := s.mapper.PrimaryKey(event.Schema, event.Table)
+	docOpts := &meilisearch.DocumentOptions{PrimaryKey: &primaryKey}
 
 	switch event.Operation {
 	case domain.OperationInsert, domain.OperationUpdate, domain.OperationRead:
@@ -82,9 +91,9 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 			// Partial update: fields omitted from NewData (e.g. unchanged
 			// TOAST columns) keep their previously indexed values instead
 			// of being wiped by a full document replacement.
-			task, err = index.UpdateDocumentsWithContext(ctx, docs, nil)
+			task, err = index.UpdateDocumentsWithContext(ctx, docs, docOpts)
 		} else {
-			task, err = index.AddDocumentsWithContext(ctx, docs, nil)
+			task, err = index.AddDocumentsWithContext(ctx, docs, docOpts)
 		}
 		if err != nil {
 			s.logger.Error("failed to write document",
@@ -113,9 +122,10 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 			return nil
 		}
 
-		id, ok := event.OldData["id"]
+		id, ok := event.OldData[primaryKey]
 		if !ok {
-			s.logger.Debug("skipping delete, no id field",
+			s.logger.Debug("skipping delete, no primary key field",
+				slog.String("primary_key", primaryKey),
 				slog.String("event_id", event.ID),
 			)
 			return nil
@@ -160,6 +170,113 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 	}
 
 	return nil
+}
+
+// applyIndexSettings creates each configured index with its primary key and
+// applies its searchable and filterable attributes. Settings that already
+// match are left alone, so a restart does not trigger a reindex.
+func (s *Sink) applyIndexSettings(ctx context.Context) error {
+	settings, err := s.mapper.IndexSettings()
+	if err != nil {
+		return err
+	}
+
+	for indexName, want := range settings {
+		if err := s.ensureIndex(ctx, indexName, want.PrimaryKey); err != nil {
+			return err
+		}
+
+		index := s.client.Index(indexName)
+
+		if len(want.SearchableAttributes) > 0 {
+			current, getErr := index.GetSearchableAttributesWithContext(ctx)
+			if getErr != nil {
+				return fmt.Errorf("get searchable attributes of %q: %w", indexName, getErr)
+			}
+			if current == nil || !slices.Equal(*current, want.SearchableAttributes) {
+				attrs := append([]string(nil), want.SearchableAttributes...)
+				task, updateErr := index.UpdateSearchableAttributesWithContext(ctx, &attrs)
+				if updateErr != nil {
+					return fmt.Errorf("update searchable attributes of %q: %w", indexName, updateErr)
+				}
+				if awaitErr := s.awaitTask(ctx, task, indexName, ""); awaitErr != nil {
+					return awaitErr
+				}
+			}
+		}
+
+		if len(want.FilterableAttributes) > 0 {
+			current, getErr := index.GetFilterableAttributesWithContext(ctx)
+			if getErr != nil {
+				return fmt.Errorf("get filterable attributes of %q: %w", indexName, getErr)
+			}
+			if !sameFilterable(current, want.FilterableAttributes) {
+				attrs := make([]any, 0, len(want.FilterableAttributes))
+				for _, attr := range want.FilterableAttributes {
+					attrs = append(attrs, attr)
+				}
+				task, updateErr := index.UpdateFilterableAttributesWithContext(ctx, &attrs)
+				if updateErr != nil {
+					return fmt.Errorf("update filterable attributes of %q: %w", indexName, updateErr)
+				}
+				if awaitErr := s.awaitTask(ctx, task, indexName, ""); awaitErr != nil {
+					return awaitErr
+				}
+			}
+		}
+
+		s.logger.Info("meilisearch index ready",
+			slog.String("index", indexName),
+			slog.String("primary_key", want.PrimaryKey),
+		)
+	}
+
+	return nil
+}
+
+// ensureIndex creates the index with the primary key when it does not exist,
+// and refuses to start against an index keyed by a different field: every
+// write would fail.
+func (s *Sink) ensureIndex(ctx context.Context, indexName, primaryKey string) error {
+	existing, err := s.client.GetIndexWithContext(ctx, indexName)
+	if err == nil {
+		if existing.PrimaryKey != "" && existing.PrimaryKey != primaryKey {
+			return fmt.Errorf(
+				"meilisearch index %q has primary key %q, config wants %q",
+				indexName, existing.PrimaryKey, primaryKey,
+			)
+		}
+		return nil
+	}
+
+	var apiErr *meilisearch.Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("get meilisearch index %q: %w", indexName, err)
+	}
+
+	task, err := s.client.CreateIndexWithContext(ctx, &meilisearch.IndexConfig{
+		Uid:        indexName,
+		PrimaryKey: primaryKey,
+	})
+	if err != nil {
+		return fmt.Errorf("create meilisearch index %q: %w", indexName, err)
+	}
+	return s.awaitTask(ctx, task, indexName, "")
+}
+
+// sameFilterable reports whether the index's filterable attributes are
+// exactly the wanted plain attribute names.
+func sameFilterable(current *[]any, want []string) bool {
+	if current == nil || len(*current) != len(want) {
+		return false
+	}
+	for i, attr := range *current {
+		name, ok := attr.(string)
+		if !ok || name != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // awaitTask blocks until the asynchronous Meilisearch task finishes and

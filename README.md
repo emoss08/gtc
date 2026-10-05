@@ -186,6 +186,8 @@ Redis Stream entries carry two fields — `event_id` (dedupe key) and
 ```json
 {
   "operation": "UPDATE",
+  "schema":    "public",
+  "table":     "users",
   "old_data":  {"id": 7, "name": "bob"},
   "new_data":  {"id": 7, "name": "alice"},
   "unchanged_toast_columns": ["bio"],
@@ -279,7 +281,20 @@ redis_json:
 meilisearch:
   tables:                                          # table -> index name
     public.products: products
+    public.orders:                                 # or an object with index settings
+      index: orders
+      primary_key: id                              # default "id"
+      searchable_attributes: [number, customer_name]
+      filterable_attributes: [tenant_id, status]
 ```
+
+Meilisearch index settings are applied when GTC starts: the index is
+created with `primary_key` if it does not exist, and searchable and
+filterable attributes are updated only when they differ, so a restart does
+not trigger a reindex. Set `primary_key` whenever rows have more than one
+column ending in `id` (e.g. `id` and `tenant_id`) — Meilisearch cannot infer
+a key then. Startup fails if an existing index is keyed by a different
+field. Tables that share an index must agree on its settings.
 
 Key patterns are Go templates with access to `{{.Prefix}}`, `{{.Schema}}`,
 `{{.Table}}`, `{{.Operation}}`, and `{{.Field "column"}}`.
