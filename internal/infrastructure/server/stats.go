@@ -198,6 +198,16 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(resp.Sinks, func(i, j int) bool { return resp.Sinks[i].Name < resp.Sinks[j].Name })
 
+	// Event counters start at zero with the process; list every backfilled
+	// (published) table anyway, so a fresh restart still shows what is
+	// captured instead of an empty table.
+	for _, b := range resp.Backfill {
+		name := b.Schema + "." + b.Table
+		if _, ok := tables[name]; !ok {
+			tables[name] = &tableStats{Table: name}
+		}
+	}
+
 	for _, ts := range tables {
 		resp.Tables = append(resp.Tables, *ts)
 	}
