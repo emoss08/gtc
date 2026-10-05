@@ -49,6 +49,11 @@ meilisearch:
     public.products: products
     public.users:
       index: users
+      # Applied at startup. Set primary_key when rows have several *id
+      # columns; Meilisearch cannot infer the key then. Default: id.
+      primary_key: id
+      searchable_attributes: [name]
+      filterable_attributes: [tenant_id]
       mask:
         email: redact
 

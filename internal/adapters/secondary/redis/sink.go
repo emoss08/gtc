@@ -59,8 +59,12 @@ func (s *StreamSink) Process(ctx context.Context, event domain.CDCEvent) error {
 
 	payload, err := sonic.Marshal(map[string]any{
 		"operation": event.Operation.String(),
-		"old_data":  event.OldData,
-		"new_data":  event.NewData,
+		// Several tables may share one stream; schema and table say which
+		// table each entry came from.
+		"schema":   event.Schema,
+		"table":    event.Table,
+		"old_data": event.OldData,
+		"new_data": event.NewData,
 		// Columns absent from new_data because their TOASTed value was
 		// unchanged; consumers must not treat them as deleted.
 		"unchanged_toast_columns": event.UnchangedToastColumns,

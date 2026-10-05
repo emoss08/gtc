@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"slices"
 
 	"gopkg.in/yaml.v3"
 )
@@ -162,11 +163,32 @@ func (c *KeyedSinkConfig) TableTransforms() map[string]TransformSpec {
 }
 
 // MeiliTableConfig is the per-table entry for the Meilisearch sink: either a
-// plain string (the index name) or an object with an index and transforms.
+// plain string (the index name) or an object with an index, index settings
+// and transforms.
 type MeiliTableConfig struct {
-	Index         string `yaml:"index"`
-	TransformSpec `yaml:",inline"`
+	Index string `yaml:"index"`
+	// PrimaryKey names the document field Meilisearch keys documents by. Set it
+	// when rows have more than one column ending in "id": Meilisearch cannot
+	// infer a key then and rejects the documents. Deletes look the document up
+	// by this field. Defaults to "id".
+	PrimaryKey string `yaml:"primary_key"`
+	// SearchableAttributes and FilterableAttributes are applied to the index at
+	// startup. Empty leaves the index's current setting alone.
+	SearchableAttributes []string `yaml:"searchable_attributes"`
+	FilterableAttributes []string `yaml:"filterable_attributes"`
+	TransformSpec        `yaml:",inline"`
 }
+
+// MeiliIndexSettings are the index-level settings the Meilisearch sink applies
+// when it starts.
+type MeiliIndexSettings struct {
+	PrimaryKey           string
+	SearchableAttributes []string
+	FilterableAttributes []string
+}
+
+// DefaultMeiliPrimaryKey is the document key used when a table sets none.
+const DefaultMeiliPrimaryKey = "id"
 
 func (c *MeiliTableConfig) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind == yaml.ScalarNode {
@@ -193,6 +215,60 @@ func (c *MeilisearchSinkConfig) GetIndex(schema, table string) (string, bool) {
 	}
 
 	return "", false
+}
+
+// GetPrimaryKey returns the document key field for the table's index.
+func (c *MeilisearchSinkConfig) GetPrimaryKey(schema, table string) string {
+	if tc, ok := c.table(schema, table); ok && tc.PrimaryKey != "" {
+		return tc.PrimaryKey
+	}
+	return DefaultMeiliPrimaryKey
+}
+
+func (c *MeilisearchSinkConfig) table(schema, table string) (MeiliTableConfig, bool) {
+	if tc, ok := c.Tables[fmt.Sprintf("%s.%s", schema, table)]; ok {
+		return tc, true
+	}
+	tc, ok := c.Tables[table]
+	return tc, ok
+}
+
+// IndexSettings returns the settings to apply per index. Several tables may
+// feed one index, but they must then agree on its settings.
+func (c *MeilisearchSinkConfig) IndexSettings() (map[string]MeiliIndexSettings, error) {
+	out := make(map[string]MeiliIndexSettings)
+	owner := make(map[string]string)
+	for name, tc := range c.Tables {
+		if tc.Index == "" {
+			continue
+		}
+		settings := MeiliIndexSettings{
+			PrimaryKey:           tc.PrimaryKey,
+			SearchableAttributes: tc.SearchableAttributes,
+			FilterableAttributes: tc.FilterableAttributes,
+		}
+		if settings.PrimaryKey == "" {
+			settings.PrimaryKey = DefaultMeiliPrimaryKey
+		}
+		if prev, ok := out[tc.Index]; ok {
+			if !sameIndexSettings(prev, settings) {
+				return nil, fmt.Errorf(
+					"meilisearch index %q: tables %s and %s set different index settings",
+					tc.Index, owner[tc.Index], name,
+				)
+			}
+			continue
+		}
+		out[tc.Index] = settings
+		owner[tc.Index] = name
+	}
+	return out, nil
+}
+
+func sameIndexSettings(a, b MeiliIndexSettings) bool {
+	return a.PrimaryKey == b.PrimaryKey &&
+		slices.Equal(a.SearchableAttributes, b.SearchableAttributes) &&
+		slices.Equal(a.FilterableAttributes, b.FilterableAttributes)
 }
 
 func (c *MeilisearchSinkConfig) TableTransforms() map[string]TransformSpec {

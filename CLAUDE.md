@@ -126,7 +126,7 @@ Consequences to keep in mind:
 Key-templated sinks (redis_stream, redis_json, webhook, nats) mirror every
 table when SINK_CONFIG_FILE is unset; with a config file present, each sink
 needs `sync_all: true` or an explicit `tables` map or it delivers nothing
-(`gtc doctor` warns about that case). The Meilisearch sink only indexes
+(`gtc doctor` warns about that case). Meilisearch table entries may set `primary_key` (default `id`), `searchable_attributes` and `filterable_attributes`; the sink applies them at startup (creating the index with its key, updating attributes only when they differ). The Meilisearch sink only indexes
 tables mapped in `SINK_CONFIG_FILE` under `meilisearch.tables`. RedisJSON key patterns should only reference replica
 identity columns (normally the primary key); other columns are absent from
 DELETE events, which would make the delete target the wrong key.
