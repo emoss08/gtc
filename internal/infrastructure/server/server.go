@@ -259,10 +259,16 @@ func (s *Server) handleBackfillTrigger(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case req.All:
-		if err := s.backfill.EnqueueAll(r.Context()); err != nil {
+		// "All" replays every published table, including completed ones;
+		// skipping those would make the request a silent no-op.
+		queued, err := s.backfill.ReplayAll(r.Context())
+		if err != nil {
 			s.writeBackfillError(w, err)
 			return
 		}
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "enqueued", "tables": queued})
+		return
 	case req.Table != "":
 		schema, table := "public", req.Table
 		if idx := strings.IndexByte(req.Table, '.'); idx > 0 {

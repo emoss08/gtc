@@ -523,17 +523,24 @@ Netflix's DBLog paper:
    streaming never pauses.
 
 Progress is persisted per table (in `gtc_backfill_state` in the source
-database), so an interrupted backfill resumes where it left off. Tables
-without a primary key are skipped with a warning.
+database, including the rows copied), so an interrupted backfill resumes where
+it left off and completed backfills still show in `GET /backfill` and the
+dashboard after a restart. Tables without a primary key are skipped with a
+warning.
 
 The HTTP API doubles as a **replay** mechanism — re-sync a table into the
 sinks at any time (e.g. after wiping a search index):
 
 ```bash
 curl -X POST localhost:8080/backfill -d '{"table":"public.products"}'
-curl -X POST localhost:8080/backfill -d '{"all":true}'
+curl -X POST localhost:8080/backfill -d '{"all":true}'   # {"status":"enqueued","tables":N}
 curl localhost:8080/backfill            # per-table progress
 ```
+
+Both forms replay from the beginning, including tables that already
+completed; `all` covers every published table and reports how many it
+queued. Tables already running or queued are left alone. (The automatic
+backfill at slot creation only fills tables that have not completed.)
 
 ## Delivery semantics
 

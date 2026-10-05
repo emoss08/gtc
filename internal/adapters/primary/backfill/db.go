@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/emoss08/gtc/internal/adapters/primary/wal"
 	"github.com/jackc/pgx/v5"
@@ -38,7 +39,7 @@ type DB interface {
 
 	EnsureStateTable(ctx context.Context) error
 	LoadState(ctx context.Context) (map[string]TableState, error)
-	SaveState(ctx context.Context, table string, cursor []string, done bool) error
+	SaveState(ctx context.Context, table string, state TableState) error
 	ClearState(ctx context.Context, table string) error
 
 	Close()
@@ -48,6 +49,10 @@ type DB interface {
 type TableState struct {
 	Cursor []string
 	Done   bool
+	// RowsCopied counts rows delivered so far, so status survives restarts.
+	RowsCopied int64
+	// UpdatedAt is when the state was last saved; loaded, never written.
+	UpdatedAt time.Time
 }
 
 type pgDB struct {
@@ -231,6 +236,13 @@ func (d *pgDB) EnsureStateTable(ctx context.Context) error {
 			done       boolean NOT NULL DEFAULT false,
 			updated_at timestamptz NOT NULL DEFAULT now()
 		)`, quoteIdent(d.stateTable)))
+	if err != nil {
+		return err
+	}
+	// Added after the table shipped; existing installs gain it in place.
+	_, err = d.pool.Exec(ctx, fmt.Sprintf(
+		`ALTER TABLE %s ADD COLUMN IF NOT EXISTS rows_copied bigint NOT NULL DEFAULT 0`,
+		quoteIdent(d.stateTable)))
 	return err
 }
 
@@ -241,7 +253,7 @@ func (d *pgDB) LoadState(ctx context.Context) (map[string]TableState, error) {
 	}
 
 	rows, err := d.pool.Query(ctx, fmt.Sprintf(
-		"SELECT table_name, cursor, done FROM %s", quoteIdent(d.stateTable)))
+		"SELECT table_name, cursor, done, rows_copied, updated_at FROM %s", quoteIdent(d.stateTable)))
 	if err != nil {
 		return nil, err
 	}
@@ -251,10 +263,12 @@ func (d *pgDB) LoadState(ctx context.Context) (map[string]TableState, error) {
 		var name string
 		var cursorJSON []byte
 		var done bool
-		if err := rows.Scan(&name, &cursorJSON, &done); err != nil {
+		var rowsCopied int64
+		var updatedAt time.Time
+		if err := rows.Scan(&name, &cursorJSON, &done, &rowsCopied, &updatedAt); err != nil {
 			return nil, err
 		}
-		ts := TableState{Done: done}
+		ts := TableState{Done: done, RowsCopied: rowsCopied, UpdatedAt: updatedAt}
 		if len(cursorJSON) > 0 {
 			if err := json.Unmarshal(cursorJSON, &ts.Cursor); err != nil {
 				return nil, fmt.Errorf("corrupt cursor for %s: %w", name, err)
@@ -265,21 +279,21 @@ func (d *pgDB) LoadState(ctx context.Context) (map[string]TableState, error) {
 	return state, rows.Err()
 }
 
-func (d *pgDB) SaveState(ctx context.Context, table string, cursor []string, done bool) error {
+func (d *pgDB) SaveState(ctx context.Context, table string, state TableState) error {
 	if d.stateTable == "" {
 		return nil
 	}
-	cursorJSON, err := json.Marshal(cursor)
+	cursorJSON, err := json.Marshal(state.Cursor)
 	if err != nil {
 		return err
 	}
 	_, err = d.pool.Exec(ctx, fmt.Sprintf(`
-		INSERT INTO %s (table_name, cursor, done, updated_at)
-		VALUES ($1, $2, $3, now())
+		INSERT INTO %s (table_name, cursor, done, rows_copied, updated_at)
+		VALUES ($1, $2, $3, $4, now())
 		ON CONFLICT (table_name)
-		DO UPDATE SET cursor = $2, done = $3, updated_at = now()`,
+		DO UPDATE SET cursor = $2, done = $3, rows_copied = $4, updated_at = now()`,
 		quoteIdent(d.stateTable)),
-		table, cursorJSON, done,
+		table, cursorJSON, state.Done, state.RowsCopied,
 	)
 	return err
 }

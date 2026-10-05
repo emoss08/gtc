@@ -34,7 +34,10 @@ type BackfillManager interface {
 	// progress (this is also the replay primitive).
 	EnqueueTable(schema, table string) error
 	// EnqueueAll schedules every table in the publication that has not
-	// already completed a backfill.
+	// already completed a backfill (resume semantics, used at startup).
 	EnqueueAll(ctx context.Context) error
+	// ReplayAll re-backfills every table in the publication from the start,
+	// completed or not, and returns how many tables were queued.
+	ReplayAll(ctx context.Context) (int, error)
 	Status() []domain.BackfillTableStatus
 }

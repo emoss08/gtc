@@ -65,6 +65,7 @@ Consequences to keep in mind:
   re-describes tables with nothing to diff against, so a missed change cannot
   be redelivered. Observers must therefore never fail the WAL stream —
   `ports.SchemaObserver` returns no error by design.
+- `POST /backfill` replays from the start: `{"table":...}` one table, `{"all":true}` every published table, completed or not (`ReplayAll`). The startup auto-backfill uses `EnqueueAll`, which only fills tables not yet done. `gtc_backfill_state` persists cursor, done and rows_copied; on start the coordinator loads it so completed backfills show in status after a restart.
 - Backfill emits `READ` events for existing rows, interleaved with the live
   stream via WAL watermarks (`pg_logical_emit_message`, prefix
   `gtc-backfill`). Chunk rows superseded by live events between the low and

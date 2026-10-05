@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -102,12 +103,26 @@ func (c *Coordinator) Start(ctx context.Context) {
 		c.mu.Lock()
 		c.state = state
 		for name, ts := range state {
-			if !ts.Done {
-				if ref, ok := splitTableName(name); ok {
-					c.logger.Info("resuming interrupted backfill", slog.String("table", name))
-					c.enqueueLocked(ref)
-				}
+			ref, ok := splitTableName(name)
+			if !ok {
+				continue
 			}
+			if ts.Done {
+				// Show backfills finished by earlier runs, so status does not
+				// read empty after every restart.
+				completed := ts.UpdatedAt.UTC()
+				c.status[name] = &domain.BackfillTableStatus{
+					Schema:      ref.Schema,
+					Table:       ref.Table,
+					State:       domain.BackfillDone,
+					RowsCopied:  ts.RowsCopied,
+					CompletedAt: &completed,
+				}
+				continue
+			}
+			c.logger.Info("resuming interrupted backfill", slog.String("table", name))
+			c.enqueueLocked(ref)
+			c.status[name].RowsCopied = ts.RowsCopied
 		}
 		c.mu.Unlock()
 	}
@@ -128,28 +143,79 @@ func (c *Coordinator) EnqueueTable(schema, table string) error {
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.current != nil && c.current.table == ref {
-		return fmt.Errorf("backfill for %s is already running", ref)
-	}
-	for _, queued := range c.queue {
-		if queued == ref {
-			return fmt.Errorf("backfill for %s is already queued", ref)
-		}
+	busy := c.busyLocked(ref)
+	c.mu.Unlock()
+	if busy {
+		return fmt.Errorf("backfill for %s is already running or queued", ref)
 	}
 
 	// Re-triggering a table is the replay primitive: start over from the
-	// beginning regardless of prior completion.
-	delete(c.state, ref.String())
-	go func() {
-		if err := c.db.ClearState(context.Background(), ref.String()); err != nil {
-			c.logger.Warn("failed to clear backfill state", slog.String("error", err.Error()))
-		}
-	}()
+	// beginning regardless of prior completion. The persisted state is cleared
+	// before the table is queued: clearing afterwards could delete the
+	// completion a small table records within milliseconds.
+	if err := c.db.ClearState(context.Background(), ref.String()); err != nil {
+		c.logger.Warn("failed to clear backfill state", slog.String("error", err.Error()))
+	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.busyLocked(ref) {
+		return fmt.Errorf("backfill for %s is already running or queued", ref)
+	}
+	delete(c.state, ref.String())
 	c.enqueueLocked(ref)
 	return nil
+}
+
+// ReplayAll re-backfills every published table from the beginning, including
+// tables that already completed. Tables already running or queued are left as
+// they are. It returns how many tables were queued.
+func (c *Coordinator) ReplayAll(ctx context.Context) (int, error) {
+	tables, err := c.db.PublicationTables(ctx, c.cfg.PublicationName)
+	if err != nil {
+		return 0, err
+	}
+
+	replay := make([]tableRef, 0, len(tables))
+	c.mu.Lock()
+	for _, t := range tables {
+		ref := tableRef{Schema: t[0], Table: t[1]}
+		if c.isExcluded(ref) || c.busyLocked(ref) {
+			continue
+		}
+		replay = append(replay, ref)
+	}
+	c.mu.Unlock()
+
+	for _, ref := range replay {
+		if err := c.db.ClearState(ctx, ref.String()); err != nil {
+			c.logger.Warn("failed to clear backfill state",
+				slog.String("table", ref.String()), slog.String("error", err.Error()))
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	queued := 0
+	for _, ref := range replay {
+		if c.busyLocked(ref) {
+			continue
+		}
+		delete(c.state, ref.String())
+		c.enqueueLocked(ref)
+		queued++
+	}
+
+	c.logger.Info("backfill replay enqueued", slog.Int("tables", queued))
+	return queued, nil
+}
+
+// busyLocked reports whether the table is running or queued. Callers hold c.mu.
+func (c *Coordinator) busyLocked(ref tableRef) bool {
+	if c.current != nil && c.current.table == ref {
+		return true
+	}
+	return slices.Contains(c.queue, ref)
 }
 
 func (c *Coordinator) EnqueueAll(ctx context.Context) error {
@@ -347,12 +413,18 @@ func (c *Coordinator) backfillTable(ctx context.Context, ref tableRef) error {
 	}
 
 	c.mu.Lock()
-	cursor := c.state[ref.String()].Cursor
+	prev := c.state[ref.String()]
 	c.mu.Unlock()
+	cursor := prev.Cursor
+	var copied int64
+	if len(cursor) > 0 {
+		copied = prev.RowsCopied // resuming: keep the count from before
+	}
 
 	now := time.Now().UTC()
 	c.setStatus(ref, func(s *domain.BackfillTableStatus) {
 		s.State = domain.BackfillRunning
+		s.RowsCopied = copied
 		if s.StartedAt == nil {
 			s.StartedAt = &now
 		}
@@ -370,10 +442,11 @@ func (c *Coordinator) backfillTable(ctx context.Context, ref tableRef) error {
 		}
 
 		if rowCount == 0 {
+			final := TableState{Done: true, RowsCopied: copied}
 			c.mu.Lock()
-			c.state[ref.String()] = TableState{Done: true}
+			c.state[ref.String()] = final
 			c.mu.Unlock()
-			if err := c.db.SaveState(ctx, ref.String(), nil, true); err != nil {
+			if err := c.db.SaveState(ctx, ref.String(), final); err != nil {
 				c.logger.Warn("failed to persist backfill completion", slog.String("error", err.Error()))
 			}
 			done := time.Now().UTC()
@@ -387,16 +460,18 @@ func (c *Coordinator) backfillTable(ctx context.Context, ref tableRef) error {
 		}
 
 		cursor = nextCursor
+		copied += int64(delivered)
+		progress := TableState{Cursor: cursor, RowsCopied: copied}
 		c.mu.Lock()
-		c.state[ref.String()] = TableState{Cursor: cursor}
+		c.state[ref.String()] = progress
 		c.mu.Unlock()
-		if err := c.db.SaveState(ctx, ref.String(), cursor, false); err != nil {
+		if err := c.db.SaveState(ctx, ref.String(), progress); err != nil {
 			c.logger.Warn("failed to persist backfill progress", slog.String("error", err.Error()))
 		}
 
 		metrics.BackfillRowsTotal.WithLabelValues(ref.Schema, ref.Table).Add(float64(delivered))
 		c.setStatus(ref, func(s *domain.BackfillTableStatus) {
-			s.RowsCopied += int64(delivered)
+			s.RowsCopied = copied
 		})
 
 		if c.cfg.ChunkDelay > 0 {

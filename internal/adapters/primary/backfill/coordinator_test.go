@@ -19,6 +19,7 @@ type fakeDB struct {
 	selects    int
 	watermarks chan watermarkPayload
 	saved      chan TableState
+	loaded     map[string]TableState // returned by LoadState; nil means empty
 }
 
 func newFakeDB(pk []string, chunks [][]Row) *fakeDB {
@@ -65,10 +66,13 @@ func (f *fakeDB) PublicationTables(context.Context, string) ([][2]string, error)
 
 func (f *fakeDB) EnsureStateTable(context.Context) error { return nil }
 func (f *fakeDB) LoadState(context.Context) (map[string]TableState, error) {
+	if f.loaded != nil {
+		return f.loaded, nil
+	}
 	return map[string]TableState{}, nil
 }
-func (f *fakeDB) SaveState(_ context.Context, _ string, cursor []string, done bool) error {
-	f.saved <- TableState{Cursor: cursor, Done: done}
+func (f *fakeDB) SaveState(_ context.Context, _ string, state TableState) error {
+	f.saved <- state
 	return nil
 }
 func (f *fakeDB) ClearState(context.Context, string) error { return nil }
@@ -261,5 +265,87 @@ func TestNonReplicationURL(t *testing.T) {
 	unchanged := "postgres://u:p@host:5432/db"
 	if got := NonReplicationURL(unchanged); got != unchanged {
 		t.Errorf("URL without replication param must be unchanged, got %q", got)
+	}
+}
+
+func TestStartShowsBackfillsCompletedBeforeRestart(t *testing.T) {
+	completedAt := time.Date(2026, 10, 5, 2, 19, 42, 0, time.UTC)
+	db := newFakeDB([]string{"id"}, nil)
+	db.loaded = map[string]TableState{
+		"public.users": {Done: true, RowsCopied: 42, UpdatedAt: completedAt},
+	}
+	c := NewCoordinator(db, Config{SlotName: "slot1"}, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+
+	status := c.Status()
+	if len(status) != 1 {
+		t.Fatalf("want the completed table in status after a restart, got %+v", status)
+	}
+	got := status[0]
+	if got.State != domain.BackfillDone || got.RowsCopied != 42 {
+		t.Errorf("want done with 42 rows, got %s with %d", got.State, got.RowsCopied)
+	}
+	if got.CompletedAt == nil || !got.CompletedAt.Equal(completedAt) {
+		t.Errorf("want completed_at %v, got %v", completedAt, got.CompletedAt)
+	}
+}
+
+func TestReplayAllRequeuesCompletedTables(t *testing.T) {
+	db := newFakeDB([]string{"id"}, nil)
+	c := NewCoordinator(db, Config{SlotName: "slot1", PublicationName: "pub"}, slog.Default())
+	c.state = map[string]TableState{"public.users": {Done: true, RowsCopied: 3}}
+
+	// Resume semantics (startup): a completed table is not queued again.
+	if err := c.EnqueueAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.queue) != 0 {
+		t.Fatalf("EnqueueAll must skip completed tables, queued %v", c.queue)
+	}
+
+	queued, err := c.ReplayAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued != 1 || len(c.queue) != 1 {
+		t.Fatalf("ReplayAll must queue the completed table, queued=%d queue=%v", queued, c.queue)
+	}
+	if _, ok := c.state["public.users"]; ok {
+		t.Error("ReplayAll must reset the table's progress")
+	}
+
+	// A table already queued is not queued twice.
+	if again, _ := c.ReplayAll(context.Background()); again != 0 {
+		t.Errorf("want 0 tables queued while the replay is pending, got %d", again)
+	}
+}
+
+func TestBackfillPersistsRowsCopied(t *testing.T) {
+	db := newFakeDB([]string{"id"}, [][]Row{{row(1, "ada"), row(2, "bob")}})
+	c := NewCoordinator(db, Config{SlotName: "slot1", ChunkSize: 10}, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	if err := c.EnqueueTable("public", "users"); err != nil {
+		t.Fatal(err)
+	}
+
+	low := waitWatermark(t, db, "low")
+	c.HandleWatermark("0/1", marshal(t, low))
+	high := waitWatermark(t, db, "high")
+	c.HandleWatermark("0/2", marshal(t, high))
+	c.WatermarkDelivered(marshal(t, high))
+
+	select {
+	case saved := <-db.saved:
+		if saved.RowsCopied != 2 || len(saved.Cursor) == 0 {
+			t.Errorf("want the chunk's progress saved with 2 rows copied, got %+v", saved)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("backfill never saved progress")
 	}
 }
