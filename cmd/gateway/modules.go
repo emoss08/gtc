@@ -55,6 +55,7 @@ func Module() fx.Option {
 func newBackfillCoordinator(
 	cfg *config.Config,
 	sinksCfg *config.SinksConfig,
+	sinks []domain.Sink,
 	logger *slog.Logger,
 ) (*backfill.Coordinator, error) {
 	if cfg.Backfill.Mode == "off" {
@@ -64,7 +65,7 @@ func newBackfillCoordinator(
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	db, err := backfill.NewDB(ctx, cfg.DatabaseURL, cfg.Backfill.StateTable)
+	db, err := backfill.NewDB(ctx, cfg.DatabaseURL, cfg.Backfill.StateTable, cfg.Backfill.Lanes)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +85,18 @@ func newBackfillCoordinator(
 		PublicationName: cfg.PublicationName,
 		ChunkSize:       cfg.Backfill.ChunkSize,
 		ChunkDelay:      cfg.Backfill.ChunkDelay,
+		Lanes:           cfg.Backfill.Lanes,
 		ExcludedTables:  excluded,
+		// Backfilled rows are READ events: a table is worth reading only
+		// if some sink would take its READ rows.
+		Wanted: func(schema, table string) bool {
+			for _, sink := range sinks {
+				if domain.Wants(sink, schema, table, domain.OperationRead) {
+					return true
+				}
+			}
+			return false
+		},
 	}, logger), nil
 }
 
@@ -164,6 +176,8 @@ func newWALReader(
 		SlotRetryInterval: cfg.SlotRetryInterval,
 		SlotRetryTimeout:  cfg.SlotRetryTimeout,
 		SchemaObserver:    schemaObserver,
+		MaxBatchEvents:    cfg.Batch.MaxEvents,
+		BatchLinger:       cfg.Batch.Linger,
 	}
 
 	if coordinator != nil {
@@ -201,6 +215,7 @@ func newSinks(
 	logger *slog.Logger,
 ) ([]domain.Sink, error) {
 	resCfg := resilience.ResilienceConfig{
+		AttemptTimeout:      cfg.ProcessTimeout,
 		MaxRetries:          cfg.Resilience.MaxRetries,
 		InitialBackoff:      cfg.Resilience.RetryBackoffInitial,
 		MaxBackoff:          cfg.Resilience.RetryBackoffMax,
@@ -390,7 +405,6 @@ func newCDCService(
 		Logger:    logger,
 		Config: services.CDCServiceConfig{
 			ParallelSinks:  cfg.ParallelSinks,
-			ProcessTimeout: cfg.ProcessTimeout,
 			ExcludedTables: excluded,
 		},
 	})
@@ -415,7 +429,7 @@ func newHTTPServer(
 	}
 
 	params := server.ServerParams{
-		Config:   server.Config{Port: cfg.HTTPPort},
+		Config:   server.Config{Port: cfg.HTTPPort, Pprof: cfg.Pprof},
 		Checker:  health,
 		Backfill: backfillManager,
 		DLQ:      dlqPort,

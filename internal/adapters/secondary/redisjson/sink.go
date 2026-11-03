@@ -41,100 +41,63 @@ func NewSink(p JSONSinkParams) (*JSONSink, error) {
 	}, nil
 }
 
-func (s *JSONSink) Process(ctx context.Context, event domain.CDCEvent) error {
-	if !s.ShouldProcess(event) {
-		s.Logger.Debug("skipping event, table not configured",
-			slog.String("table", event.FullTableName()),
-			slog.String("event_id", event.ID),
-		)
+// Process writes the batch in one pipelined round trip. Commands run in
+// stream order on one connection, so a row written then deleted in the same
+// batch ends up deleted.
+func (s *JSONSink) Process(ctx context.Context, events []domain.CDCEvent) error {
+	pipe := s.Client.Pipeline()
+	queued := 0
+
+	for i := range events {
+		event := &events[i]
+		if !s.ShouldProcess(*event) {
+			continue
+		}
+
+		switch event.Operation {
+		case domain.OperationInsert, domain.OperationUpdate, domain.OperationRead:
+			if event.NewData == nil {
+				continue
+			}
+			key, err := s.GenerateKey(*event)
+			if err != nil {
+				return domain.Permanent(err)
+			}
+			jsonData, err := sonic.Marshal(event.NewData)
+			if err != nil {
+				return domain.Permanent(fmt.Errorf("marshal data for event %s: %w", event.ID, err))
+			}
+			// When an UPDATE omits unchanged TOAST columns, a full JSON.SET
+			// would erase their previously stored values, so merge into the
+			// existing document instead. JSON.MERGE (RFC 7386) deletes fields
+			// whose incoming value is null, which matches a column set to NULL.
+			command := "JSON.SET"
+			if event.Operation == domain.OperationUpdate && len(event.UnchangedToastColumns) > 0 {
+				command = "JSON.MERGE"
+			}
+			pipe.Do(ctx, command, key, "$", jsonData)
+			queued++
+
+		case domain.OperationDelete:
+			key, err := s.GenerateKey(*event)
+			if err != nil {
+				return domain.Permanent(err)
+			}
+			pipe.Del(ctx, key)
+			queued++
+
+		case domain.OperationTruncate:
+			s.Logger.Warn("truncate operation not supported for redis json sink",
+				slog.String("table", event.FullTableName()),
+			)
+		}
+	}
+
+	if queued == 0 {
 		return nil
 	}
-
-	key, err := s.GenerateKey(event)
-	if err != nil {
-		return err
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("write %d json commands: %w", queued, err)
 	}
-
-	switch event.Operation {
-	case domain.OperationInsert, domain.OperationUpdate, domain.OperationRead:
-		return s.setJSON(ctx, key, event)
-	case domain.OperationDelete:
-		return s.deleteKey(ctx, key, event)
-	case domain.OperationTruncate:
-		s.Logger.Warn("truncate operation not supported for redis json sink",
-			slog.String("table", event.FullTableName()),
-		)
-		return nil
-	default:
-		s.Logger.Warn("unknown operation",
-			slog.String("operation", event.Operation.String()),
-			slog.String("event_id", event.ID),
-		)
-		return nil
-	}
-}
-
-func (s *JSONSink) setJSON(ctx context.Context, key string, event domain.CDCEvent) error {
-	data := event.NewData
-	if data == nil {
-		s.Logger.Warn("no new data for insert/update",
-			slog.String("event_id", event.ID),
-			slog.String("key", key),
-		)
-		return nil
-	}
-
-	jsonData, err := sonic.Marshal(data)
-	if err != nil {
-		s.Logger.Error("failed to marshal data",
-			slog.String("error", err.Error()),
-			slog.String("event_id", event.ID),
-		)
-		return fmt.Errorf("marshal data: %w", err)
-	}
-
-	// When an UPDATE omits unchanged TOAST columns, a full JSON.SET would
-	// erase their previously stored values, so merge into the existing
-	// document instead. Note JSON.MERGE (RFC 7386) deletes fields whose
-	// incoming value is null, which matches a column being set to NULL.
-	command := "JSON.SET"
-	if event.Operation == domain.OperationUpdate && len(event.UnchangedToastColumns) > 0 {
-		command = "JSON.MERGE"
-	}
-
-	if err := s.Client.Do(ctx, command, key, "$", string(jsonData)).Err(); err != nil {
-		s.Logger.Error("failed to write json",
-			slog.String("error", err.Error()),
-			slog.String("command", command),
-			slog.String("key", key),
-			slog.String("event_id", event.ID),
-		)
-		return fmt.Errorf("%s: %w", command, err)
-	}
-
-	s.Logger.Debug("json set",
-		slog.String("key", key),
-		slog.String("event_id", event.ID),
-		slog.String("operation", event.Operation.String()),
-	)
-
-	return nil
-}
-
-func (s *JSONSink) deleteKey(ctx context.Context, key string, event domain.CDCEvent) error {
-	if err := s.Client.Del(ctx, key).Err(); err != nil {
-		s.Logger.Error("failed to delete key",
-			slog.String("error", err.Error()),
-			slog.String("key", key),
-			slog.String("event_id", event.ID),
-		)
-		return fmt.Errorf("delete key: %w", err)
-	}
-
-	s.Logger.Debug("key deleted",
-		slog.String("key", key),
-		slog.String("event_id", event.ID),
-	)
-
 	return nil
 }

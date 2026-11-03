@@ -19,6 +19,7 @@ import (
 )
 
 type Server struct {
+	pprof      bool
 	router     *chi.Mux
 	httpServer *http.Server
 	logger     *slog.Logger
@@ -52,6 +53,8 @@ type HealthChecker interface {
 
 type Config struct {
 	Port int
+	// Pprof mounts Go's profiler under /debug (CDC_PPROF_ENABLED).
+	Pprof bool
 }
 
 type ServerParams struct {
@@ -86,6 +89,7 @@ func New(p ServerParams) *Server {
 		sampler:   newSampler(),
 		info:      p.Info,
 		schema:    p.Schema,
+		pprof:     p.Config.Pprof,
 		httpServer: &http.Server{
 			Addr:         fmt.Sprintf(":%d", p.Config.Port),
 			Handler:      r,
@@ -111,6 +115,9 @@ func (s *Server) registerRoutes() {
 	s.router.Get("/api/stats", s.handleStats)
 	s.router.Get("/api/history", s.handleHistory)
 	s.router.Get("/api/schema", s.handleSchema)
+	if s.pprof {
+		s.router.Mount("/debug", middleware.Profiler())
+	}
 
 	if s.ui != nil {
 		s.router.Get("/*", s.handleUI())

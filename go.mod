@@ -18,7 +18,6 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/sony/gobreaker/v2 v2.4.0
-	github.com/sourcegraph/conc v0.3.0
 	go.uber.org/fx v1.24.0
 	gopkg.in/yaml.v3 v3.0.1
 )

@@ -77,7 +77,7 @@ func TestDeliversEventAsJSON(t *testing.T) {
 	srv, rec := serve(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	sink := newSink(t, Config{URL: srv.URL}, nil)
 
-	if err := sink.Process(context.Background(), testEvent()); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err != nil {
 		t.Fatalf("process: %v", err)
 	}
 
@@ -120,7 +120,7 @@ func TestSignsBodyWhenSecretConfigured(t *testing.T) {
 	srv, rec := serve(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
 	sink := newSink(t, Config{URL: srv.URL, SigningSecret: "topsecret"}, nil)
 
-	if err := sink.Process(context.Background(), testEvent()); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err != nil {
 		t.Fatalf("process: %v", err)
 	}
 
@@ -146,7 +146,7 @@ func TestNoSignatureHeadersWithoutSecret(t *testing.T) {
 	srv, rec := serve(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	sink := newSink(t, Config{URL: srv.URL}, nil)
 
-	if err := sink.Process(context.Background(), testEvent()); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err != nil {
 		t.Fatalf("process: %v", err)
 	}
 	_, headers, _ := rec.snapshot()
@@ -159,7 +159,7 @@ func TestSendsAuthHeader(t *testing.T) {
 	srv, rec := serve(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	sink := newSink(t, Config{URL: srv.URL, AuthHeader: "Bearer token123"}, nil)
 
-	if err := sink.Process(context.Background(), testEvent()); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err != nil {
 		t.Fatalf("process: %v", err)
 	}
 	if _, headers, _ := rec.snapshot(); headers.Get("Authorization") != "Bearer token123" {
@@ -176,7 +176,7 @@ func TestNonSuccessStatusIsAnError(t *testing.T) {
 	})
 	sink := newSink(t, Config{URL: srv.URL}, nil)
 
-	err := sink.Process(context.Background(), testEvent())
+	err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()})
 	if err == nil {
 		t.Fatal("a 500 response must be an error")
 	}
@@ -188,7 +188,7 @@ func TestNonSuccessStatusIsAnError(t *testing.T) {
 func TestUnreachableEndpointIsAnError(t *testing.T) {
 	// Port 1 on loopback refuses connections immediately.
 	sink := newSink(t, Config{URL: "http://127.0.0.1:1/hook"}, nil)
-	if err := sink.Process(context.Background(), testEvent()); err == nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err == nil {
 		t.Fatal("an unreachable endpoint must be an error")
 	}
 }
@@ -202,7 +202,7 @@ func TestTimeoutIsAnError(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	sink := newSink(t, Config{URL: srv.URL, Timeout: 150 * time.Millisecond}, nil)
-	if err := sink.Process(context.Background(), testEvent()); err == nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err == nil {
 		t.Fatal("a hung receiver must time out, not block the pipeline forever")
 	}
 }
@@ -215,7 +215,7 @@ func TestFilteredTablesAreNotDelivered(t *testing.T) {
 	srv, rec := serve(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	sink := newSink(t, Config{URL: srv.URL}, onlyTable{table: "orders"})
 
-	if err := sink.Process(context.Background(), testEvent()); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err != nil {
 		t.Fatalf("a filtered event must be skipped, not fail: %v", err)
 	}
 	if count, _, _ := rec.snapshot(); count != 0 {
@@ -237,7 +237,7 @@ func TestRespectsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	if err := sink.Process(ctx, testEvent()); err == nil {
+	if err := sink.Process(ctx, []domain.CDCEvent{testEvent()}); err == nil {
 		t.Fatal("a cancelled context must abort the delivery")
 	}
 }
@@ -249,7 +249,7 @@ func TestDeleteEventCarriesOldDataOnly(t *testing.T) {
 	event := testEvent()
 	event.Operation = domain.OperationDelete
 	event.NewData = nil
-	if err := sink.Process(context.Background(), event); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{event}); err != nil {
 		t.Fatalf("process: %v", err)
 	}
 

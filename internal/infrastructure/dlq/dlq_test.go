@@ -91,7 +91,7 @@ func (s *flakySink) Name() string                      { return s.name }
 func (s *flakySink) Initialize(context.Context) error  { return nil }
 func (s *flakySink) Shutdown(context.Context) error    { return nil }
 func (s *flakySink) HealthCheck(context.Context) error { return nil }
-func (s *flakySink) Process(context.Context, domain.CDCEvent) error {
+func (s *flakySink) Process(context.Context, []domain.CDCEvent) error {
 	s.processed++
 	if s.failures > 0 {
 		s.failures--
@@ -132,13 +132,13 @@ func TestParkAfterThresholdFailures(t *testing.T) {
 
 	// First two failures propagate (the stream would tear down and replay).
 	for i := 0; i < 2; i++ {
-		if err := sink.Process(ctx, testEvent("0/100")); err == nil {
+		if err := sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")}); err == nil {
 			t.Fatalf("failure %d must propagate before the threshold", i+1)
 		}
 	}
 
 	// Third failure parks: pipeline advances.
-	if err := sink.Process(ctx, testEvent("0/100")); err != nil {
+	if err := sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")}); err != nil {
 		t.Fatalf("threshold failure must park and return nil, got %v", err)
 	}
 
@@ -163,7 +163,7 @@ func TestCircuitOpenNeverParks(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 10; i++ {
-		if err := sink.Process(ctx, testEvent("0/100")); err == nil {
+		if err := sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")}); err == nil {
 			t.Fatal("circuit-open failures must always propagate")
 		}
 	}
@@ -179,16 +179,16 @@ func TestSuccessClearsFailureCount(t *testing.T) {
 	sink := m.WrapSink(inner)
 	ctx := context.Background()
 
-	_ = sink.Process(ctx, testEvent("0/100")) // fail 1
-	_ = sink.Process(ctx, testEvent("0/100")) // fail 2
-	if err := sink.Process(ctx, testEvent("0/100")); err != nil {
+	_ = sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")}) // fail 1
+	_ = sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")}) // fail 2
+	if err := sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")}); err != nil {
 		t.Fatalf("third attempt should succeed: %v", err)
 	}
 
 	// The count was cleared: two fresh failures must NOT reach threshold.
 	inner.failures = 2
-	_ = sink.Process(ctx, testEvent("0/100"))
-	if err := sink.Process(ctx, testEvent("0/100")); err == nil {
+	_ = sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")})
+	if err := sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")}); err == nil {
 		t.Fatal("second failure after reset must propagate, not park")
 	}
 	if n, _ := store.Len(ctx); n != 0 {
@@ -205,7 +205,7 @@ func TestFullDLQKeepsStalling(t *testing.T) {
 
 	var err error
 	for i := 0; i < 3; i++ {
-		err = sink.Process(ctx, testEvent("0/100"))
+		err = sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")})
 	}
 	if err == nil {
 		t.Fatal("a full DLQ must propagate the failure, never drop the event")
@@ -223,7 +223,7 @@ func TestRetrySuccessRemovesEntry(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		_ = sink.Process(ctx, testEvent("0/100"))
+		_ = sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")})
 	}
 	if n, _ := store.Len(ctx); n != 1 {
 		t.Fatal("expected a parked entry")
@@ -246,7 +246,7 @@ func TestRetryFailureUpdatesEntry(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		_ = sink.Process(ctx, testEvent("0/100"))
+		_ = sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")})
 	}
 
 	if err := m.Retry(ctx, "s:0/100"); err == nil {
@@ -271,8 +271,8 @@ func TestRetryAll(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		_ = sinkA.Process(ctx, testEvent("0/100"))
-		_ = sinkB.Process(ctx, testEvent("0/200"))
+		_ = sinkA.Process(ctx, []domain.CDCEvent{testEvent("0/100")})
+		_ = sinkB.Process(ctx, []domain.CDCEvent{testEvent("0/200")})
 	}
 
 	result, err := m.RetryAll(ctx)
@@ -294,7 +294,7 @@ func TestDiscard(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		_ = sink.Process(ctx, testEvent("0/100"))
+		_ = sink.Process(ctx, []domain.CDCEvent{testEvent("0/100")})
 	}
 	if err := m.Discard(ctx, "s:0/100"); err != nil {
 		t.Fatal(err)

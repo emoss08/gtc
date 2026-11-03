@@ -133,9 +133,14 @@ Sink implementation rules (these are the contract that keeps GTC correct):
   replaces whole documents, you must merge instead (see the RedisJSON
   `JSON.MERGE` and Meilisearch `UpdateDocuments` handling for examples) —
   otherwise you will erase real data.
-- **Honor the context.** `Process` runs synchronously with the WAL stream
-  under `CDC_PROCESS_TIMEOUT`; use context-aware client calls so a hung
-  backend can't stall replication past `wal_sender_timeout`.
+- **Deliver the batch, not the rows.** `Process` receives a batch in stream
+  order; apply it in order with as few round trips as the backend allows
+  (pipelines, bulk endpoints), and implement `domain.BatchLimiter` if your
+  unit of delivery is one event. Wrap errors caused by the data itself with
+  `domain.Permanent` so they are isolated instead of retried.
+- **Honor the context.** Each attempt runs under `CDC_PROCESS_TIMEOUT`; use
+  context-aware client calls so a hung backend fails the attempt instead of
+  stalling the pipeline.
 - **Return errors honestly.** A returned error is what prevents the WAL
   position from being confirmed — swallowing one converts "retry later"
   into permanent data loss. If your backend acknowledges writes

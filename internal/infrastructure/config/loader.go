@@ -16,11 +16,17 @@ func Load() (*Config, error) {
 		SlotName:        getEnv("CDC_SLOT_NAME", "cdc_demo_slot"),
 		PublicationName: getEnv("CDC_PUBLICATION_NAME", "cdc_demo_publication"),
 		StandbyTimeout:  getDuration("CDC_STANDBY_TIMEOUT", 10*time.Second),
-		ParallelSinks:   getBool("CDC_PARALLEL_SINKS", false),
-		// Kept well below Postgres's default wal_sender_timeout (60s):
-		// sinks run synchronously with the WAL stream, and a stalled sink
-		// must not starve standby keepalives long enough to be disconnected.
-		ProcessTimeout:    getDuration("CDC_PROCESS_TIMEOUT", 10*time.Second),
+		// Sinks are independent destinations, so a batch fans out to them
+		// concurrently: its latency is the slowest sink, not their sum.
+		ParallelSinks: getBool("CDC_PARALLEL_SINKS", true),
+		// Bounds one delivery attempt of one batch to one sink. The stream
+		// keeps sending keepalives while sinks work, so this is independent
+		// of wal_sender_timeout.
+		ProcessTimeout: getDuration("CDC_PROCESS_TIMEOUT", 30*time.Second),
+		Batch: BatchConfig{
+			MaxEvents: getInt("CDC_BATCH_MAX_EVENTS", 5000),
+			Linger:    getDuration("CDC_BATCH_LINGER", 10*time.Millisecond),
+		},
 		ExcludedTables:    parseTableSet("CDC_EXCLUDED_TABLES"),
 		HTTPPort:          getInt("HTTP_PORT", 8080),
 		AutoCreateSlot:    getBool("CDC_AUTO_CREATE_SLOT", true),
@@ -29,12 +35,14 @@ func Load() (*Config, error) {
 		SlotRetryTimeout:  getDuration("CDC_SLOT_RETRY_TIMEOUT", 60*time.Second),
 		Backfill: BackfillConfig{
 			Mode:       getEnv("CDC_BACKFILL_MODE", "auto"),
-			ChunkSize:  getInt("CDC_BACKFILL_CHUNK_SIZE", 1000),
+			ChunkSize:  getInt("CDC_BACKFILL_CHUNK_SIZE", 5000),
+			Lanes:      getInt("CDC_BACKFILL_CONCURRENCY", 4),
 			ChunkDelay: getDuration("CDC_BACKFILL_CHUNK_DELAY", 0),
 			StateTable: backfillStateTable(),
 		},
 		MaskHMACKey:  os.Getenv("CDC_MASK_HMAC_KEY"),
 		SchemaEvents: getBool("CDC_SCHEMA_EVENTS", true),
+		Pprof:        getBool("CDC_PPROF_ENABLED", false),
 		DLQ: DLQConfig{
 			Enabled:    getBool("CDC_DLQ_ENABLED", true),
 			Threshold:  getInt("CDC_DLQ_THRESHOLD", 3),

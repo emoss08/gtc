@@ -84,9 +84,9 @@ func Run(ctx context.Context, out io.Writer) int {
 	if cfg != nil {
 		checkPostgres(ctx, r, cfg)
 	}
-	sinkCount := checkSinks(ctx, r, cfg)
+	checkSinks(ctx, r, cfg)
 	if cfg != nil {
-		checkPipelineFit(ctx, r, cfg, sinkCount)
+		checkPipelineFit(ctx, r, cfg)
 	}
 
 	warns, fails := 0, 0
@@ -305,7 +305,7 @@ func checkPostgres(ctx context.Context, r *report, cfg *config.Config) {
 }
 
 // checkSinks probes each configured sink and returns how many are enabled.
-func checkSinks(ctx context.Context, r *report, cfg *config.Config) int {
+func checkSinks(ctx context.Context, r *report, cfg *config.Config) {
 	r.section("Sinks")
 
 	sinksCfg, err := config.LoadSinksConfig()
@@ -373,7 +373,6 @@ func checkSinks(ctx context.Context, r *report, cfg *config.Config) int {
 		r.add("outbox", fail, "outbox is configured but REDIS_URL is unset")
 	}
 
-	return count
 }
 
 func checkRedis(ctx context.Context, r *report, name, rawURL string, needJSON bool) {
@@ -536,10 +535,11 @@ func checkTransforms(r *report, cfg *config.Config, sinksCfg *config.SinksConfig
 	}
 }
 
-// checkPipelineFit warns when sink timeouts could starve standby keepalives:
-// sinks run synchronously with the WAL stream, so the worst case is every
-// sink timing out on one event back to back.
-func checkPipelineFit(ctx context.Context, r *report, cfg *config.Config, sinkCount int) {
+// checkPipelineFit warns when standby keepalives could be too sparse for
+// the server: the stream sends one every CDC_STANDBY_TIMEOUT, including while
+// sinks work on a batch, so that interval must stay well inside
+// wal_sender_timeout.
+func checkPipelineFit(ctx context.Context, r *report, cfg *config.Config) {
 	r.section("Pipeline")
 
 	db, err := pgx.Connect(ctx, plainURL(cfg.DatabaseURL))
@@ -555,20 +555,18 @@ func checkPipelineFit(ctx context.Context, r *report, cfg *config.Config, sinkCo
 		return
 	}
 	if senderTimeoutMS == 0 {
-		r.add("timeouts", pass, "wal_sender_timeout is disabled")
+		r.add("keepalive", pass, "wal_sender_timeout is disabled")
 		return
 	}
 
 	senderTimeout := time.Duration(senderTimeoutMS) * time.Millisecond
-	worstCase := time.Duration(max(sinkCount, 1)) * cfg.ProcessTimeout
-	if worstCase >= senderTimeout {
-		r.add("timeouts", warn,
-			"%d sink(s) x CDC_PROCESS_TIMEOUT (%s) = %s, which can exceed wal_sender_timeout (%s) "+
-				"and get the replication connection dropped mid-event — lower CDC_PROCESS_TIMEOUT "+
-				"or raise wal_sender_timeout",
-			max(sinkCount, 1), cfg.ProcessTimeout, worstCase, senderTimeout)
+	if cfg.StandbyTimeout*2 > senderTimeout {
+		r.add("keepalive", warn,
+			"CDC_STANDBY_TIMEOUT (%s) is more than half of wal_sender_timeout (%s): one delayed "+
+				"keepalive can get the replication connection dropped — lower CDC_STANDBY_TIMEOUT",
+			cfg.StandbyTimeout, senderTimeout)
 	} else {
-		r.add("timeouts", pass, "%d sink(s) x CDC_PROCESS_TIMEOUT (%s) fits within wal_sender_timeout (%s)",
-			max(sinkCount, 1), cfg.ProcessTimeout, senderTimeout)
+		r.add("keepalive", pass, "CDC_STANDBY_TIMEOUT (%s) fits within wal_sender_timeout (%s)",
+			cfg.StandbyTimeout, senderTimeout)
 	}
 }

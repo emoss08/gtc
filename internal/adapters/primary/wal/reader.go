@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/emoss08/gtc/internal/core/ports"
 	"github.com/emoss08/gtc/internal/infrastructure/metrics"
 	"github.com/jackc/pglogrepl"
@@ -42,7 +43,17 @@ type Config struct {
 	// slotCreated reports whether this run created the replication slot —
 	// true only on the very first start against a fresh database.
 	StreamStarted func(slotCreated bool)
+	// MaxBatchEvents caps the events handed to the sinks at once.
+	MaxBatchEvents int
+	// BatchLinger is the longest an event waits for its batch to fill
+	// before the batch is handed over anyway.
+	BatchLinger time.Duration
 }
+
+const (
+	defaultMaxBatchEvents = 5000
+	defaultBatchLinger    = 10 * time.Millisecond
+)
 
 type Reader struct {
 	config      Config
@@ -67,7 +78,7 @@ func NewReader(cfg Config, logger *slog.Logger) *Reader {
 	}
 }
 
-func (r *Reader) Start(ctx context.Context, handler ports.WALEventHandler) error {
+func (r *Reader) Start(ctx context.Context, handler ports.WALBatchHandler) error {
 	defer close(r.done)
 	defer r.closeConnection()
 
@@ -121,9 +132,6 @@ func (r *Reader) Start(ctx context.Context, handler ports.WALEventHandler) error
 
 		r.logger.Info("WAL streaming started, listening for changes")
 		if err := r.streamLoop(ctx, handler); err != nil {
-			if r.config.Controller != nil {
-				r.config.Controller.OnStreamRestart()
-			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -354,40 +362,207 @@ func (r *Reader) startReplicationWithRetry(ctx context.Context, startLSN pglogre
 	}
 }
 
-func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) error {
+// delivery is one ordered unit of work for the delivery goroutine.
+type delivery struct {
+	events []domain.CDCEvent
+	// ack is confirmed once events are handled (0: nothing to confirm).
+	ack pglogrepl.LSN
+	// watermark, when set, is reported delivered once events are handled.
+	watermark []byte
+}
+
+// deliveryQueueDepth is how many batches may wait behind the one the sinks
+// are working on. Decoding runs ahead of delivery by at most this much.
+const deliveryQueueDepth = 2
+
+// streamLoop reads the replication stream and hands events to the handler in
+// batches. A batch closes when it reaches MaxBatchEvents, when BatchLinger has
+// passed since its first event, or before a backfill watermark is handled;
+// under load the socket backlog fills each batch, and when the stream is quiet
+// the linger bounds the added latency. A batch may span transactions and may
+// hold part of a large one.
+//
+// Decoding and delivery overlap: batches go to a delivery goroutine through a
+// small ordered queue, so the next batch is decoded while sinks write the
+// current one. Positions are confirmed by the delivery goroutine only after
+// the batch holding every event before them was handled, so delivery stays
+// at-least-once. This goroutine keeps sole use of the connection and keeps
+// sending keepalives however long the sinks take.
+func (r *Reader) streamLoop(ctx context.Context, handler ports.WALBatchHandler) error {
 	r.streaming.Store(true)
 	defer r.streaming.Store(false)
 
+	if r.config.Controller != nil {
+		r.config.Controller.OnStreamStart()
+		defer r.config.Controller.OnStreamStop()
+	}
+
+	maxBatch := r.config.MaxBatchEvents
+	if maxBatch <= 0 {
+		maxBatch = defaultMaxBatchEvents
+	}
+	linger := r.config.BatchLinger
+	if linger <= 0 {
+		linger = defaultBatchLinger
+	}
+
+	confirm := func(lsn pglogrepl.LSN) {
+		if uint64(lsn) > r.clientLSN.Load() {
+			r.clientLSN.Store(uint64(lsn))
+			metrics.LastProcessedLSN.Set(float64(lsn))
+		}
+	}
+
+	// --- delivery goroutine ---
+	queue := make(chan delivery, deliveryQueueDepth)
+	failed := make(chan error, 1)
+	var outstanding atomic.Int64 // queued or being delivered
+	var eventsProcessed atomic.Int64
+	deliverCtx, cancelDeliver := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for d := range queue {
+			if len(d.events) > 0 {
+				if err := r.deliver(deliverCtx, handler, d.events); err != nil {
+					failed <- err
+					return
+				}
+				eventsProcessed.Add(int64(len(d.events)))
+			}
+			if d.watermark != nil {
+				r.config.Controller.WatermarkDelivered(d.watermark)
+			}
+			if d.ack > 0 {
+				confirm(d.ack)
+			}
+			outstanding.Add(-1)
+		}
+	}()
+	defer func() {
+		// Batches still queued were never confirmed and are redelivered
+		// after reconnect; drop them and let the one in progress finish.
+		for {
+			select {
+			case <-queue:
+				continue
+			default:
+			}
+			break
+		}
+		close(queue)
+		wg.Wait()
+		cancelDeliver()
+	}()
+
 	nextDeadline := time.Now().Add(r.config.StandbyTimeout)
-	eventsProcessed := int64(0)
+	keepalive := func() error {
+		if err := r.sendStandbyStatus(ctx); err != nil {
+			r.logger.Error("failed to send standby status", slog.String("error", err.Error()))
+			return err
+		}
+		nextDeadline = time.Now().Add(r.config.StandbyTimeout)
+		return nil
+	}
+
+	// enqueue hands a unit to the delivery goroutine, keeping the
+	// connection alive while the queue is full.
+	enqueue := func(d delivery) error {
+		outstanding.Add(1)
+		for {
+			wait := time.Until(nextDeadline)
+			timer := time.NewTimer(max(wait, 0))
+			select {
+			case queue <- d:
+				timer.Stop()
+				return nil
+			case err := <-failed:
+				timer.Stop()
+				return err
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+				if err := keepalive(); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	var (
+		batch      []domain.CDCEvent
+		flushAt    time.Time     // when the open batch must be handed over
+		pendingAck pglogrepl.LSN // confirmable once everything before it is handled
+	)
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		d := delivery{events: batch, ack: pendingAck}
+		// A fresh slice: the delivery goroutine owns the old one.
+		batch = nil
+		flushAt = time.Time{}
+		pendingAck = 0
+		return enqueue(d)
+	}
 
 	for {
 		select {
 		case <-r.shutdown:
 			r.logger.Info(
 				"shutdown signal received",
-				slog.Int64("events_processed", eventsProcessed),
+				slog.Int64("events_processed", eventsProcessed.Load()),
 			)
 			return nil
 		case <-ctx.Done():
-			r.logger.Info("context cancelled", slog.Int64("events_processed", eventsProcessed))
+			r.logger.Info("context cancelled", slog.Int64("events_processed", eventsProcessed.Load()))
 			return ctx.Err()
+		case err := <-failed:
+			return err
 		default:
 		}
 
-		if time.Now().After(nextDeadline) {
-			if err := r.sendStandbyStatus(ctx); err != nil {
-				r.logger.Error("failed to send standby status", slog.String("error", err.Error()))
+		now := time.Now()
+		if len(batch) > 0 && !now.Before(flushAt) {
+			if err := flush(); err != nil {
 				return err
 			}
-			nextDeadline = time.Now().Add(r.config.StandbyTimeout)
+		}
+		// An ack with no batch to ride on is confirmed once everything
+		// handed over before it is delivered.
+		if pendingAck > 0 && len(batch) == 0 && outstanding.Load() == 0 {
+			confirm(pendingAck)
+			pendingAck = 0
 		}
 
-		msgCtx, cancel := context.WithDeadline(ctx, nextDeadline)
+		if !now.Before(nextDeadline) {
+			if err := keepalive(); err != nil {
+				return err
+			}
+		}
+
+		receiveBy := nextDeadline
+		if len(batch) > 0 && flushAt.Before(receiveBy) {
+			receiveBy = flushAt
+		}
+		if pendingAck > 0 && len(batch) == 0 {
+			// Come back soon to confirm it once deliveries drain.
+			if soon := now.Add(50 * time.Millisecond); soon.Before(receiveBy) {
+				receiveBy = soon
+			}
+		}
+		msgCtx, cancel := context.WithDeadline(ctx, receiveBy)
 		rawMsg, err := r.conn.ReceiveMessage(msgCtx)
 		cancel()
 
 		if err != nil {
+			if ctx.Err() != nil {
+				// Shutdown: not a stream failure.
+				return ctx.Err()
+			}
 			if pgconn.Timeout(err) {
 				continue
 			}
@@ -421,53 +596,47 @@ func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) 
 		}
 
 		for _, event := range result.Events {
-			r.logger.Debug("event received",
-				slog.String("operation", event.Operation.String()),
-				slog.String("schema", event.Schema),
-				slog.String("table", event.Table),
-				slog.String("lsn", event.Metadata.LSN),
-				slog.Int("xid", int(event.Metadata.TransactionID)),
-			)
-
 			if r.config.Controller != nil {
 				r.config.Controller.ObserveEvent(event)
 			}
-
-			// A handler error means at least one sink did not durably
-			// process the event. Returning the error tears down the
-			// connection without confirming the transaction's LSN, so the
-			// server redelivers it on reconnect (at-least-once delivery).
-			if err := handler(ctx, event); err != nil {
-				r.logger.Error("handler failed",
-					slog.String("error", err.Error()),
-					slog.String("event_id", event.ID),
-				)
-				return fmt.Errorf("handler failed: %w", err)
+			if len(batch) == 0 {
+				batch = make([]domain.CDCEvent, 0, min(maxBatch, 256))
+				flushAt = time.Now().Add(linger)
 			}
-			eventsProcessed++
+			batch = append(batch, event)
+			if len(batch) >= maxBatch {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
 		}
 
 		if msg := result.Message; msg != nil && msg.Prefix == WatermarkPrefix && r.config.Controller != nil {
-			// Backfill chunk rows are emitted at the high-watermark
-			// position; a handler error tears the stream down and the
-			// coordinator retries the chunk with fresh watermarks.
-			events := r.config.Controller.HandleWatermark(msg.LSN.String(), msg.Content)
-			for _, event := range events {
-				if err := handler(ctx, event); err != nil {
-					r.logger.Error("backfill handler failed",
-						slog.String("error", err.Error()),
-						slog.String("event_id", event.ID),
-					)
-					return fmt.Errorf("backfill handler failed: %w", err)
-				}
-				eventsProcessed++
+			// Backfill chunk rows are emitted at the high-watermark position,
+			// queued behind every live event streamed before it. A delivery
+			// error tears the stream down and the coordinator retries the
+			// chunk with fresh watermarks.
+			if err := flush(); err != nil {
+				return err
 			}
-			r.config.Controller.WatermarkDelivered(msg.Content)
+			events := r.config.Controller.HandleWatermark(msg.LSN.String(), msg.Content)
+			for start := 0; ; start += maxBatch {
+				end := min(start+maxBatch, len(events))
+				d := delivery{events: events[start:end]}
+				if end == len(events) {
+					d.watermark = msg.Content
+				}
+				if err := enqueue(d); err != nil {
+					return err
+				}
+				if end == len(events) {
+					break
+				}
+			}
 		}
 
-		if uint64(result.AckLSN) > r.clientLSN.Load() {
-			r.clientLSN.Store(uint64(result.AckLSN))
-			metrics.LastProcessedLSN.Set(float64(result.AckLSN))
+		if result.AckLSN > 0 && result.AckLSN > pendingAck {
+			pendingAck = result.AckLSN
 		}
 		if result.ServerWALEnd > 0 {
 			if lag := int64(uint64(result.ServerWALEnd) - r.clientLSN.Load()); lag >= 0 {
@@ -476,13 +645,24 @@ func (r *Reader) streamLoop(ctx context.Context, handler ports.WALEventHandler) 
 		}
 
 		if result.RequestReply {
-			if err := r.sendStandbyStatus(ctx); err != nil {
-				r.logger.Error("failed to send requested standby status", slog.String("error", err.Error()))
+			if err := keepalive(); err != nil {
 				return err
 			}
-			nextDeadline = time.Now().Add(r.config.StandbyTimeout)
 		}
 	}
+}
+
+// deliver runs the handler for one batch.
+func (r *Reader) deliver(ctx context.Context, handler ports.WALBatchHandler, events []domain.CDCEvent) error {
+	if err := handler(ctx, events); err != nil {
+		r.logger.Error("handler failed",
+			slog.String("error", err.Error()),
+			slog.Int("events", len(events)),
+			slog.String("first_event_id", events[0].ID),
+		)
+		return fmt.Errorf("handler failed: %w", err)
+	}
+	return nil
 }
 
 func (r *Reader) sendStandbyStatus(ctx context.Context) error {

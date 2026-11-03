@@ -111,14 +111,31 @@ type metadata struct {
 	Timestamp     time.Time `json:"timestamp"`
 }
 
-func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
-	if s.filter != nil && !s.filter.ShouldProcess(event.Schema, event.Table) {
-		s.logger.Debug("skipping event, table not configured",
-			slog.String("table", event.FullTableName()),
-			slog.String("event_id", event.ID),
-		)
-		return nil
+// MaxBatchEvents is 1: each event is its own request, so retries, timeouts
+// and dead-lettering apply per event and a failure never re-posts events the
+// receiver already accepted.
+func (s *Sink) MaxBatchEvents() int { return 1 }
+
+func (s *Sink) Wants(schema, table string, _ domain.Operation) bool {
+	return s.filter == nil || s.filter.ShouldProcess(schema, table)
+}
+
+// Process delivers the batch one request per event, in order: each event is
+// its own signed request, and a receiver applies them as they arrive.
+func (s *Sink) Process(ctx context.Context, events []domain.CDCEvent) error {
+	for i := range events {
+		event := &events[i]
+		if s.filter != nil && !s.filter.ShouldProcess(event.Schema, event.Table) {
+			continue
+		}
+		if err := s.deliver(ctx, *event); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func (s *Sink) deliver(ctx context.Context, event domain.CDCEvent) error {
 
 	body, err := sonic.Marshal(payload{
 		EventID:               event.ID,
@@ -135,7 +152,7 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
+		return domain.Permanent(fmt.Errorf("marshal payload for event %s: %w", event.ID, err))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.config.URL, bytes.NewReader(body))
@@ -165,8 +182,14 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
-		return fmt.Errorf("webhook returned %s for event %s: %s",
+		err := fmt.Errorf("webhook returned %s for event %s: %s",
 			resp.Status, event.ID, bytes.TrimSpace(detail))
+		switch resp.StatusCode {
+		case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+			// The receiver rejected this payload; resending it cannot pass.
+			return domain.Permanent(err)
+		}
+		return err
 	}
 	// Drain so the connection can be reused for the next event.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, errorBodyLimit))

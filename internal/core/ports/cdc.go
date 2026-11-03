@@ -9,5 +9,5 @@ import (
 type CDCService interface {
 	Start(ctx context.Context) error
 	Stop(ctx context.Context) error
-	ProcessEvent(ctx context.Context, event domain.CDCEvent) []domain.SinkResult
+	ProcessBatch(ctx context.Context, events []domain.CDCEvent) []domain.SinkResult
 }

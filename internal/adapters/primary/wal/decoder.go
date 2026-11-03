@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"fmt"
 	"time"
 
@@ -31,7 +32,7 @@ type txnState struct {
 func NewDecoder() *Decoder {
 	return &Decoder{
 		relations: make(map[uint32]*pglogrepl.RelationMessageV2),
-		typeMap:   pgtype.NewMap(),
+		typeMap:   NewTypeMap(),
 	}
 }
 
@@ -175,8 +176,11 @@ func (d *Decoder) decodeWALData(walData []byte, lsn pglogrepl.LSN) (*DecodeResul
 
 	case *pglogrepl.LogicalDecodingMessageV2:
 		result.Message = &LogicalMessage{
-			Prefix:  msg.Prefix,
-			Content: msg.Content,
+			Prefix: msg.Prefix,
+			// The parsed content aliases the connection's receive buffer,
+			// which the next message overwrites; consumers may hold it past
+			// that (delivery is asynchronous), so it gets its own copy.
+			Content: bytes.Clone(msg.Content),
 			LSN:     msg.LSN,
 		}
 

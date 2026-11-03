@@ -14,6 +14,7 @@ type Config struct {
 	StandbyTimeout    time.Duration
 	ParallelSinks     bool
 	ProcessTimeout    time.Duration
+	Batch             BatchConfig
 	ExcludedTables    map[string]struct{}
 	HTTPPort          int
 	Resilience        ResilienceConfig
@@ -30,6 +31,25 @@ type Config struct {
 	// "<REDIS_STREAM_PREFIX>:schema". Detection, metrics, logging and the
 	// /api/schema history are always on; this only controls publishing.
 	SchemaEvents bool
+	// Pprof exposes Go's profiler under /debug/pprof on the HTTP port.
+	Pprof bool
+}
+
+// BatchConfig shapes the batches the WAL reader hands to the sinks.
+type BatchConfig struct {
+	// MaxEvents caps one batch. Backfill chunks larger than this are
+	// delivered in several batches.
+	MaxEvents int
+	// Linger is the longest an event waits for its batch to fill when the
+	// stream goes quiet; under load batches fill before it elapses.
+	Linger time.Duration
+}
+
+func (c BatchConfig) Validate() error {
+	return validation.ValidateStruct(&c,
+		validation.Field(&c.MaxEvents, validation.Required, validation.Min(1)),
+		validation.Field(&c.Linger, validation.Required, validation.Min(time.Millisecond)),
+	)
 }
 
 type DLQConfig struct {
@@ -48,8 +68,10 @@ type BackfillConfig struct {
 	// Mode: "auto" backfills all published tables when the replication
 	// slot is first created (and resumes interrupted backfills on start);
 	// "manual" only backfills via the HTTP API; "off" disables backfill.
-	Mode       string
-	ChunkSize  int
+	Mode      string
+	ChunkSize int
+	// Lanes is how many tables backfill concurrently.
+	Lanes      int
 	ChunkDelay time.Duration
 	// StateTable is the table used to persist per-table progress in the
 	// source database. Empty disables persistence (backfills restart from
@@ -81,6 +103,7 @@ func (c Config) Validate() error {
 		),
 		validation.Field(&c.Resilience),
 		validation.Field(&c.Backfill),
+		validation.Field(&c.Batch),
 	)
 }
 
@@ -88,6 +111,7 @@ func (c BackfillConfig) Validate() error {
 	return validation.ValidateStruct(&c,
 		validation.Field(&c.Mode, validation.Required, validation.In("auto", "manual", "off")),
 		validation.Field(&c.ChunkSize, validation.Min(1)),
+		validation.Field(&c.Lanes, validation.Min(1)),
 	)
 }
 

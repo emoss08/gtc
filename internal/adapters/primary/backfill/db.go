@@ -3,6 +3,7 @@ package backfill
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -39,8 +40,14 @@ type DB interface {
 
 	EnsureStateTable(ctx context.Context) error
 	LoadState(ctx context.Context) (map[string]TableState, error)
+	// LoadTableState reads one table's persisted state; found is false when
+	// none is stored.
+	LoadTableState(ctx context.Context, table string) (state TableState, found bool, err error)
 	SaveState(ctx context.Context, table string, state TableState) error
-	ClearState(ctx context.Context, table string) error
+	// MarkPending records tables as queued from the start, replacing any
+	// prior progress, so a restart resumes them even before their first
+	// chunk.
+	MarkPending(ctx context.Context, tables []string) error
 
 	Close()
 }
@@ -59,6 +66,9 @@ type pgDB struct {
 	pool       *pgxpool.Pool
 	stateTable string // "" disables persistence
 	typeMap    *pgtype.Map
+	// flushArg: the server (17+) accepts pg_logical_emit_message's flush
+	// argument.
+	flushArg bool
 }
 
 // NonReplicationURL strips the replication parameter from a PostgreSQL URL so
@@ -74,31 +84,65 @@ func NonReplicationURL(databaseURL string) string {
 	return u.String()
 }
 
-func NewDB(ctx context.Context, databaseURL, stateTable string) (DB, error) {
+// NewDB opens the backfill's connection pool, sized for lanes concurrent
+// tables (each emits watermarks and selects chunks).
+func NewDB(ctx context.Context, databaseURL, stateTable string, lanes int) (DB, error) {
 	cfg, err := pgxpool.ParseConfig(NonReplicationURL(databaseURL))
 	if err != nil {
 		return nil, fmt.Errorf("parse backfill database URL: %w", err)
 	}
-	cfg.MaxConns = 2
+	cfg.MaxConns = int32(max(2, 2*lanes))
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect for backfill: %w", err)
 	}
 
-	return &pgDB{pool: pool, stateTable: stateTable, typeMap: pgtype.NewMap()}, nil
+	var versionNum int
+	if err := pool.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&versionNum); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("read server version: %w", err)
+	}
+
+	return &pgDB{
+		pool:       pool,
+		stateTable: stateTable,
+		typeMap:    wal.NewTypeMap(),
+		flushArg:   versionNum >= 170000,
+	}, nil
 }
 
 func (d *pgDB) Close() {
 	d.pool.Close()
 }
 
+// EmitWatermark writes a watermark into the WAL and makes it durable at once.
+// The walsender only ships flushed WAL, and a non-transactional message is not
+// flushed by itself: without a flush every watermark waits for the WAL
+// writer (wal_writer_delay, 200ms by default), twice per chunk, which bounds
+// backfill to a few chunks per second however small the tables are.
+// PostgreSQL 17+ flushes on request; older servers get a transactional
+// message committed with synchronous_commit on, which flushes at commit. Both
+// place the watermark in the stream at the point the call returns, which is
+// all the watermark algorithm needs.
 func (d *pgDB) EmitWatermark(ctx context.Context, payload []byte) error {
-	_, err := d.pool.Exec(ctx,
-		"SELECT pg_logical_emit_message(false, $1, $2::text)",
-		wal.WatermarkPrefix, string(payload),
-	)
-	return err
+	if d.flushArg {
+		_, err := d.pool.Exec(ctx,
+			"SELECT pg_logical_emit_message(false, $1, $2::text, true)",
+			wal.WatermarkPrefix, string(payload),
+		)
+		return err
+	}
+	return pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = on"); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx,
+			"SELECT pg_logical_emit_message(true, $1, $2::text)",
+			wal.WatermarkPrefix, string(payload),
+		)
+		return err
+	})
 }
 
 func (d *pgDB) PrimaryKey(ctx context.Context, schema, table string) ([]string, error) {
@@ -279,6 +323,30 @@ func (d *pgDB) LoadState(ctx context.Context) (map[string]TableState, error) {
 	return state, rows.Err()
 }
 
+func (d *pgDB) LoadTableState(ctx context.Context, table string) (TableState, bool, error) {
+	if d.stateTable == "" {
+		return TableState{}, false, nil
+	}
+	var cursorJSON []byte
+	var ts TableState
+	err := d.pool.QueryRow(ctx, fmt.Sprintf(
+		"SELECT cursor, done, rows_copied, updated_at FROM %s WHERE table_name = $1",
+		quoteIdent(d.stateTable)), table,
+	).Scan(&cursorJSON, &ts.Done, &ts.RowsCopied, &ts.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TableState{}, false, nil
+	}
+	if err != nil {
+		return TableState{}, false, err
+	}
+	if len(cursorJSON) > 0 && string(cursorJSON) != "null" {
+		if err := json.Unmarshal(cursorJSON, &ts.Cursor); err != nil {
+			return TableState{}, false, fmt.Errorf("corrupt cursor for %s: %w", table, err)
+		}
+	}
+	return ts, true, nil
+}
+
 func (d *pgDB) SaveState(ctx context.Context, table string, state TableState) error {
 	if d.stateTable == "" {
 		return nil
@@ -298,12 +366,16 @@ func (d *pgDB) SaveState(ctx context.Context, table string, state TableState) er
 	return err
 }
 
-func (d *pgDB) ClearState(ctx context.Context, table string) error {
-	if d.stateTable == "" {
+func (d *pgDB) MarkPending(ctx context.Context, tables []string) error {
+	if d.stateTable == "" || len(tables) == 0 {
 		return nil
 	}
-	_, err := d.pool.Exec(ctx, fmt.Sprintf(
-		"DELETE FROM %s WHERE table_name = $1", quoteIdent(d.stateTable)), table)
+	_, err := d.pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s (table_name, cursor, done, rows_copied, updated_at)
+		SELECT t, NULL, false, 0, now() FROM unnest($1::text[]) AS t
+		ON CONFLICT (table_name)
+		DO UPDATE SET cursor = NULL, done = false, rows_copied = 0, updated_at = now()`,
+		quoteIdent(d.stateTable)), tables)
 	return err
 }
 

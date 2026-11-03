@@ -92,6 +92,31 @@ func (m *Manager) clearFailure(sinkName, eventID string) {
 	m.mu.Unlock()
 }
 
+// failureInfo reports how many failure cycles the event went through and
+// when the first was. An event never counted (a permanent failure isolated
+// on first sight) has failed once, now.
+func (m *Manager) failureInfo(sinkName, eventID string) (int, time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rec, ok := m.failures[sinkName+":"+eventID]; ok && rec.count > 0 {
+		return rec.count, rec.first
+	}
+	return 1, time.Now().UTC()
+}
+
+// clearFailures forgets recorded failures for a delivered batch. Failures are
+// rare, so the common case is one map length check.
+func (m *Manager) clearFailures(sinkName string, events []domain.CDCEvent) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.failures) == 0 {
+		return
+	}
+	for i := range events {
+		delete(m.failures, sinkName+":"+events[i].ID)
+	}
+}
+
 func (m *Manager) park(
 	ctx context.Context,
 	sinkName string,
@@ -158,7 +183,7 @@ func (m *Manager) Retry(ctx context.Context, id string) error {
 	retryCtx, cancel := context.WithTimeout(ctx, m.retryTimeout)
 	defer cancel()
 
-	if procErr := sink.Process(retryCtx, entry.Event); procErr != nil {
+	if procErr := sink.Process(retryCtx, []domain.CDCEvent{entry.Event}); procErr != nil {
 		entry.Attempts++
 		entry.Error = procErr.Error()
 		entry.LastFailedAt = time.Now().UTC()

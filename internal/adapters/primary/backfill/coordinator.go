@@ -2,10 +2,13 @@ package backfill
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -21,29 +24,62 @@ import (
 // the remainder is emitted into the sink pipeline exactly at the high
 // watermark's stream position — so per-key ordering holds and streaming never
 // pauses.
+//
+// Several tables run at once (Config.Lanes), and within a table up to
+// pipelineDepth chunks are in flight: the next chunk is selected while the
+// stream is still delivering the previous one. Chunks of one table never
+// overlap in the WAL (a chunk's low watermark follows the previous chunk's
+// high watermark), and progress is persisted only for delivered chunks, in
+// order.
 type Coordinator struct {
 	db     DB
 	logger *slog.Logger
 	cfg    Config
 
-	mu      sync.Mutex
-	queue   []tableRef
-	state   map[string]TableState
-	status  map[string]*domain.BackfillTableStatus
-	current *chunkInFlight
+	mu       sync.Mutex
+	queue    []tableRef
+	running  map[tableRef]bool
+	state    map[string]TableState
+	status   map[string]*domain.BackfillTableStatus
+	inflight map[string]*chunkInFlight // by chunk id
 
-	wake      chan struct{}
-	chunkDone chan struct{}
-	restart   chan struct{}
-	chunkSeq  int
+	wake     chan struct{}
+	chunkSeq int
+	// streaming is true while this process consumes the replication
+	// stream; chunks only run then. streamUp is closed (and replaced) when
+	// it starts.
+	streaming bool
+	streamUp  chan struct{}
+	// restart is closed (and replaced) when in-flight chunks must be
+	// abandoned: the stream went down, or came up with chunks emitted while
+	// it was down.
+	restart chan struct{}
+	// instance tags this process's chunk ids. Several nodes may share a
+	// slot (one streams, the others stand by) and see each other's
+	// watermarks in the WAL; a bare per-process sequence would collide.
+	instance string
 }
+
+const (
+	// DefaultChunkSize is the number of rows selected per watermarked chunk.
+	DefaultChunkSize = 5000
+	// DefaultLanes is how many tables backfill concurrently.
+	DefaultLanes = 4
+	// pipelineDepth is how many chunks of one table may be in flight.
+	pipelineDepth = 2
+)
 
 type Config struct {
 	SlotName        string
 	PublicationName string
 	ChunkSize       int
 	ChunkDelay      time.Duration
-	ExcludedTables  map[string]struct{}
+	// Lanes is how many tables backfill concurrently.
+	Lanes          int
+	ExcludedTables map[string]struct{}
+	// Wanted reports whether any sink consumes backfilled rows of the table;
+	// tables no sink wants are not backfilled. Nil wants every table.
+	Wanted func(schema, table string) bool
 }
 
 type tableRef struct {
@@ -61,7 +97,12 @@ type chunkInFlight struct {
 	seen    map[string]struct{}
 	pending []Row
 	pkCols  []string
-	lsn     string
+
+	rowCount   int      // rows selected
+	lastCursor []string // cursor after this chunk
+	delivered  int      // rows emitted at the high watermark
+	done       chan struct{}
+	restart    <-chan struct{}
 }
 
 type watermarkPayload struct {
@@ -77,22 +118,28 @@ var (
 
 func NewCoordinator(db DB, cfg Config, logger *slog.Logger) *Coordinator {
 	if cfg.ChunkSize <= 0 {
-		cfg.ChunkSize = 1000
+		cfg.ChunkSize = DefaultChunkSize
+	}
+	if cfg.Lanes <= 0 {
+		cfg.Lanes = DefaultLanes
 	}
 	return &Coordinator{
-		db:        db,
-		logger:    logger.With(slog.String("component", "backfill")),
-		cfg:       cfg,
-		state:     make(map[string]TableState),
-		status:    make(map[string]*domain.BackfillTableStatus),
-		wake:      make(chan struct{}, 1),
-		chunkDone: make(chan struct{}, 1),
-		restart:   make(chan struct{}, 1),
+		db:       db,
+		logger:   logger.With(slog.String("component", "backfill")),
+		cfg:      cfg,
+		running:  make(map[tableRef]bool),
+		state:    make(map[string]TableState),
+		status:   make(map[string]*domain.BackfillTableStatus),
+		inflight: make(map[string]*chunkInFlight),
+		wake:     make(chan struct{}, cfg.Lanes),
+		streamUp: make(chan struct{}),
+		restart:  make(chan struct{}),
+		instance: newInstanceID(),
 	}
 }
 
 // Start loads persisted progress, re-enqueues interrupted tables, and runs
-// the chunking worker until ctx is cancelled.
+// the backfill lanes until ctx is cancelled.
 func (c *Coordinator) Start(ctx context.Context) {
 	if err := c.db.EnsureStateTable(ctx); err != nil {
 		c.logger.Warn("backfill state table unavailable, progress will not survive restarts",
@@ -120,6 +167,9 @@ func (c *Coordinator) Start(ctx context.Context) {
 				}
 				continue
 			}
+			if c.isExcluded(ref) || !c.wanted(ref) {
+				continue
+			}
 			c.logger.Info("resuming interrupted backfill", slog.String("table", name))
 			c.enqueueLocked(ref)
 			c.status[name].RowsCopied = ts.RowsCopied
@@ -127,11 +177,17 @@ func (c *Coordinator) Start(ctx context.Context) {
 		c.mu.Unlock()
 	}
 
-	go c.worker(ctx)
+	for range c.cfg.Lanes {
+		go c.lane(ctx)
+	}
 }
 
 func (c *Coordinator) Close() {
 	c.db.Close()
+}
+
+func (c *Coordinator) wanted(ref tableRef) bool {
+	return c.cfg.Wanted == nil || c.cfg.Wanted(ref.Schema, ref.Table)
 }
 
 // --- ports.BackfillManager ---
@@ -141,7 +197,9 @@ func (c *Coordinator) EnqueueTable(schema, table string) error {
 	if c.isExcluded(ref) {
 		return fmt.Errorf("table %s is excluded from CDC", ref)
 	}
-
+	if !c.wanted(ref) {
+		return fmt.Errorf("no sink consumes rows of %s, nothing to backfill", ref)
+	}
 	c.mu.Lock()
 	busy := c.busyLocked(ref)
 	c.mu.Unlock()
@@ -150,11 +208,11 @@ func (c *Coordinator) EnqueueTable(schema, table string) error {
 	}
 
 	// Re-triggering a table is the replay primitive: start over from the
-	// beginning regardless of prior completion. The persisted state is cleared
-	// before the table is queued: clearing afterwards could delete the
+	// beginning regardless of prior completion. The table is persisted as
+	// pending before it is queued: resetting afterwards could erase the
 	// completion a small table records within milliseconds.
-	if err := c.db.ClearState(context.Background(), ref.String()); err != nil {
-		c.logger.Warn("failed to clear backfill state", slog.String("error", err.Error()))
+	if err := c.db.MarkPending(context.Background(), []string{ref.String()}); err != nil {
+		c.logger.Warn("failed to persist pending backfill", slog.String("error", err.Error()))
 	}
 
 	c.mu.Lock()
@@ -180,18 +238,15 @@ func (c *Coordinator) ReplayAll(ctx context.Context) (int, error) {
 	c.mu.Lock()
 	for _, t := range tables {
 		ref := tableRef{Schema: t[0], Table: t[1]}
-		if c.isExcluded(ref) || c.busyLocked(ref) {
+		if c.isExcluded(ref) || !c.wanted(ref) || c.busyLocked(ref) {
 			continue
 		}
 		replay = append(replay, ref)
 	}
 	c.mu.Unlock()
 
-	for _, ref := range replay {
-		if err := c.db.ClearState(ctx, ref.String()); err != nil {
-			c.logger.Warn("failed to clear backfill state",
-				slog.String("table", ref.String()), slog.String("error", err.Error()))
-		}
+	if err := c.db.MarkPending(ctx, tableNames(replay)); err != nil {
+		c.logger.Warn("failed to persist pending backfills", slog.String("error", err.Error()))
 	}
 
 	c.mu.Lock()
@@ -212,10 +267,7 @@ func (c *Coordinator) ReplayAll(ctx context.Context) (int, error) {
 
 // busyLocked reports whether the table is running or queued. Callers hold c.mu.
 func (c *Coordinator) busyLocked(ref tableRef) bool {
-	if c.current != nil && c.current.table == ref {
-		return true
-	}
-	return slices.Contains(c.queue, ref)
+	return c.running[ref] || slices.Contains(c.queue, ref)
 }
 
 func (c *Coordinator) EnqueueAll(ctx context.Context) error {
@@ -224,36 +276,48 @@ func (c *Coordinator) EnqueueAll(ctx context.Context) error {
 		return err
 	}
 
+	candidates := make([]tableRef, 0, len(tables))
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	enqueued := 0
 	for _, t := range tables {
 		ref := tableRef{Schema: t[0], Table: t[1]}
-		if c.isExcluded(ref) {
+		if c.isExcluded(ref) || !c.wanted(ref) || c.busyLocked(ref) {
 			continue
 		}
 		if ts, ok := c.state[ref.String()]; ok && ts.Done {
 			continue
 		}
-		if c.current != nil && c.current.table == ref {
+		candidates = append(candidates, ref)
+	}
+	c.mu.Unlock()
+
+	// Persist the whole queue first: a restart before a table's first chunk
+	// must still resume it, or its rows would never be backfilled.
+	if err := c.db.MarkPending(ctx, tableNames(candidates)); err != nil {
+		c.logger.Warn("failed to persist pending backfills; a restart may lose the queue",
+			slog.String("error", err.Error()))
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	enqueued := 0
+	for _, ref := range candidates {
+		if c.busyLocked(ref) {
 			continue
 		}
-		alreadyQueued := false
-		for _, queued := range c.queue {
-			if queued == ref {
-				alreadyQueued = true
-				break
-			}
-		}
-		if !alreadyQueued {
-			c.enqueueLocked(ref)
-			enqueued++
-		}
+		c.enqueueLocked(ref)
+		enqueued++
 	}
 
 	c.logger.Info("backfill enqueued", slog.Int("tables", enqueued))
 	return nil
+}
+
+func tableNames(refs []tableRef) []string {
+	names := make([]string, len(refs))
+	for i, ref := range refs {
+		names[i] = ref.String()
+	}
+	return names
 }
 
 func (c *Coordinator) Status() []domain.BackfillTableStatus {
@@ -273,27 +337,31 @@ func (c *Coordinator) ObserveEvent(event domain.CDCEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	cur := c.current
-	if cur == nil || !cur.collecting {
+	if len(c.inflight) == 0 {
 		return
 	}
-	if event.Schema != cur.table.Schema || event.Table != cur.table.Table {
-		return
+	var key string
+	var keyed bool
+	for _, ch := range c.inflight {
+		if !ch.collecting || event.Schema != ch.table.Schema || event.Table != ch.table.Table {
+			continue
+		}
+		if !keyed {
+			data := event.NewData
+			if event.Operation == domain.OperationDelete {
+				data = event.OldData
+			}
+			if data == nil {
+				return
+			}
+			var ok bool
+			if key, ok = pkKeyFromData(data, ch.pkCols); !ok {
+				return
+			}
+			keyed = true
+		}
+		ch.seen[key] = struct{}{}
 	}
-
-	data := event.NewData
-	if event.Operation == domain.OperationDelete {
-		data = event.OldData
-	}
-	if data == nil {
-		return
-	}
-
-	key, ok := pkKeyFromData(data, cur.pkCols)
-	if !ok {
-		return
-	}
-	cur.seen[key] = struct{}{}
 }
 
 func (c *Coordinator) HandleWatermark(lsn string, content []byte) []domain.CDCEvent {
@@ -305,38 +373,42 @@ func (c *Coordinator) HandleWatermark(lsn string, content []byte) []domain.CDCEv
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	cur := c.current
-	if cur == nil || cur.id != payload.Chunk {
-		// Watermark from an abandoned chunk attempt (stream replay after
-		// reconnect); the coordinator has already moved on.
+	ch := c.inflight[payload.Chunk]
+	c.logger.Debug("watermark",
+		slog.String("chunk", payload.Chunk), slog.String("mark", payload.Mark),
+		slog.Bool("known", ch != nil), slog.Int("inflight", len(c.inflight)))
+	if ch == nil {
+		// Another node's chunk, or an abandoned attempt replayed after a
+		// reconnect.
 		return nil
 	}
 
 	switch payload.Mark {
 	case "low":
-		cur.collecting = true
+		ch.collecting = true
 		return nil
 	case "high":
-		cur.collecting = false
-		cur.lsn = lsn
-
-		events := make([]domain.CDCEvent, 0, len(cur.pending))
-		for _, row := range cur.pending {
-			if _, superseded := cur.seen[row.Key]; superseded {
+		ch.collecting = false
+		events := make([]domain.CDCEvent, 0, len(ch.pending))
+		now := time.Now().UTC()
+		for _, row := range ch.pending {
+			if _, superseded := ch.seen[row.Key]; superseded {
 				continue
 			}
 			events = append(events, domain.CDCEvent{
-				ID:        fmt.Sprintf("bf:%s:%s", cur.id, row.Key),
+				ID:        "bf:" + ch.id + ":" + row.Key,
 				Operation: domain.OperationRead,
-				Schema:    cur.table.Schema,
-				Table:     cur.table.Table,
+				Schema:    ch.table.Schema,
+				Table:     ch.table.Table,
 				NewData:   row.Values,
 				Metadata: domain.EventMetadata{
 					LSN:       lsn,
-					Timestamp: time.Now().UTC(),
+					Timestamp: now,
 				},
 			})
 		}
+		ch.delivered = len(events)
+		ch.pending = nil // the events own the rows now
 		return events
 	}
 	return nil
@@ -349,27 +421,65 @@ func (c *Coordinator) WatermarkDelivered(content []byte) {
 	}
 
 	c.mu.Lock()
-	match := c.current != nil && c.current.id == payload.Chunk
-	c.mu.Unlock()
-
-	if match {
-		signal(c.chunkDone)
+	defer c.mu.Unlock()
+	if ch := c.inflight[payload.Chunk]; ch != nil {
+		delete(c.inflight, payload.Chunk)
+		close(ch.done)
 	}
 }
 
-func (c *Coordinator) OnStreamRestart() {
+func (c *Coordinator) OnStreamStart() {
 	c.mu.Lock()
-	inFlight := c.current != nil
-	c.mu.Unlock()
+	defer c.mu.Unlock()
 
-	if inFlight {
-		signal(c.restart)
+	c.streaming = true
+	close(c.streamUp)
+	c.streamUp = make(chan struct{})
+	// Chunks emitted while the stream was down may sit behind a position
+	// another node already confirmed and never come back: re-emit them.
+	if len(c.inflight) > 0 {
+		c.restartLocked()
 	}
 }
 
-// --- worker ---
+func (c *Coordinator) OnStreamStop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-func (c *Coordinator) worker(ctx context.Context) {
+	c.streaming = false
+	if len(c.inflight) > 0 {
+		c.restartLocked()
+	}
+}
+
+// restartLocked abandons every in-flight chunk; their tables continue from
+// the last delivered chunk with fresh watermarks.
+func (c *Coordinator) restartLocked() {
+	clear(c.inflight)
+	close(c.restart)
+	c.restart = make(chan struct{})
+}
+
+// waitForStream blocks until this process consumes the replication stream.
+func (c *Coordinator) waitForStream(ctx context.Context) error {
+	for {
+		c.mu.Lock()
+		up, ch := c.streaming, c.streamUp
+		c.mu.Unlock()
+		if up {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+		}
+	}
+}
+
+// --- lanes ---
+
+func (c *Coordinator) lane(ctx context.Context) {
 	for {
 		ref, ok := c.pop()
 		if !ok {
@@ -381,7 +491,12 @@ func (c *Coordinator) worker(ctx context.Context) {
 			}
 		}
 
-		if err := c.backfillTable(ctx, ref); err != nil {
+		err := c.backfillTable(ctx, ref)
+		c.mu.Lock()
+		delete(c.running, ref)
+		c.mu.Unlock()
+
+		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -412,6 +527,33 @@ func (c *Coordinator) backfillTable(ctx context.Context, ref tableRef) error {
 		return nil
 	}
 
+	// Another node may have advanced or finished this table since this
+	// process loaded its state (failover between nodes sharing a slot):
+	// the persisted row is the truth.
+	if persisted, found, err := c.db.LoadTableState(ctx, ref.String()); err != nil {
+		c.logger.Warn("failed to reload backfill state, using cached progress",
+			slog.String("table", ref.String()), slog.String("error", err.Error()))
+	} else {
+		c.mu.Lock()
+		if found {
+			c.state[ref.String()] = persisted
+		} else {
+			delete(c.state, ref.String())
+		}
+		c.mu.Unlock()
+		if found && persisted.Done {
+			completed := persisted.UpdatedAt.UTC()
+			c.setStatus(ref, func(s *domain.BackfillTableStatus) {
+				s.State = domain.BackfillDone
+				s.RowsCopied = persisted.RowsCopied
+				s.CompletedAt = &completed
+				s.Error = ""
+			})
+			c.logger.Info("backfill already completed", slog.String("table", ref.String()))
+			return nil
+		}
+	}
+
 	c.mu.Lock()
 	prev := c.state[ref.String()]
 	c.mu.Unlock()
@@ -425,6 +567,7 @@ func (c *Coordinator) backfillTable(ctx context.Context, ref tableRef) error {
 	c.setStatus(ref, func(s *domain.BackfillTableStatus) {
 		s.State = domain.BackfillRunning
 		s.RowsCopied = copied
+		s.Error = ""
 		if s.StartedAt == nil {
 			s.StartedAt = &now
 		}
@@ -435,13 +578,56 @@ func (c *Coordinator) backfillTable(ctx context.Context, ref tableRef) error {
 		slog.Bool("resuming", len(cursor) > 0),
 	)
 
+	// window holds this table's in-flight chunks in WAL order. next is
+	// where the following chunk starts; exhausted is set once a short chunk
+	// was selected.
+	var window []*chunkInFlight
+	next := cursor
+	exhausted := false
+	defer func() { c.abandon(window) }()
+
 	for {
-		delivered, nextCursor, rowCount, err := c.runChunk(ctx, ref, pkCols, cursor)
-		if err != nil {
-			return err
+		for !exhausted && len(window) < pipelineDepth {
+			ch, err := c.startChunk(ctx, ref, pkCols, next)
+			if err != nil {
+				return err
+			}
+			window = append(window, ch)
+			next = ch.lastCursor
+			if ch.rowCount < c.cfg.ChunkSize {
+				exhausted = true
+			}
 		}
 
-		if rowCount == 0 {
+		head := window[0]
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case <-head.restart:
+			// The stream went down (or came back) with chunks in flight:
+			// everything after the last delivered chunk is selected again
+			// with fresh watermarks; re-emitted rows are idempotent.
+			c.logger.Warn("stream restarted mid-chunk, retrying",
+				slog.String("table", ref.String()),
+				slog.String("chunk", head.id),
+			)
+			c.abandon(window)
+			window = nil
+			next = cursor
+			exhausted = false
+			continue
+
+		case <-head.done:
+		}
+
+		window = window[1:]
+		copied += int64(head.delivered)
+		metrics.BackfillRowsTotal.WithLabelValues(ref.Schema, ref.Table).Add(float64(head.delivered))
+
+		// A short chunk is the table's last: keyset pagination found no
+		// rows past it, and rows inserted since arrive on the live stream.
+		if head.rowCount < c.cfg.ChunkSize {
 			final := TableState{Done: true, RowsCopied: copied}
 			c.mu.Lock()
 			c.state[ref.String()] = final
@@ -452,15 +638,16 @@ func (c *Coordinator) backfillTable(ctx context.Context, ref tableRef) error {
 			done := time.Now().UTC()
 			c.setStatus(ref, func(s *domain.BackfillTableStatus) {
 				s.State = domain.BackfillDone
+				s.RowsCopied = copied
 				s.CompletedAt = &done
 				s.Error = ""
 			})
-			c.logger.Info("backfill complete", slog.String("table", ref.String()))
+			c.logger.Info("backfill complete",
+				slog.String("table", ref.String()), slog.Int64("rows", copied))
 			return nil
 		}
 
-		cursor = nextCursor
-		copied += int64(delivered)
+		cursor = head.lastCursor
 		progress := TableState{Cursor: cursor, RowsCopied: copied}
 		c.mu.Lock()
 		c.state[ref.String()] = progress
@@ -468,8 +655,6 @@ func (c *Coordinator) backfillTable(ctx context.Context, ref tableRef) error {
 		if err := c.db.SaveState(ctx, ref.String(), progress); err != nil {
 			c.logger.Warn("failed to persist backfill progress", slog.String("error", err.Error()))
 		}
-
-		metrics.BackfillRowsTotal.WithLabelValues(ref.Schema, ref.Table).Add(float64(delivered))
 		c.setStatus(ref, func(s *domain.BackfillTableStatus) {
 			s.RowsCopied = copied
 		})
@@ -484,85 +669,76 @@ func (c *Coordinator) backfillTable(ctx context.Context, ref tableRef) error {
 	}
 }
 
-// runChunk executes one watermarked chunk, retrying on stream restarts. It
-// returns the number of rows delivered to sinks, the cursor for the next
-// chunk, and the number of rows selected (0 means the table is exhausted).
-func (c *Coordinator) runChunk(
+// startChunk emits the low watermark, selects the chunk, and emits the high
+// watermark; the stream then delivers it. A chunk that selects no rows has
+// nothing to deliver and completes at once.
+func (c *Coordinator) startChunk(
 	ctx context.Context,
 	ref tableRef,
 	pkCols, cursor []string,
-) (delivered int, nextCursor []string, rowCount int, err error) {
-	for {
-		c.mu.Lock()
-		c.chunkSeq++
-		chunk := &chunkInFlight{
-			table:  ref,
-			id:     fmt.Sprintf("%s-%d", ref.String(), c.chunkSeq),
-			seen:   make(map[string]struct{}),
-			pkCols: pkCols,
-		}
-		c.current = chunk
-		drain(c.chunkDone)
-		drain(c.restart)
-		c.mu.Unlock()
-
-		clearCurrent := func() {
-			c.mu.Lock()
-			c.current = nil
-			c.mu.Unlock()
-		}
-
-		// DBLog ordering: low watermark, then the chunk select, then the
-		// high watermark. Any event streamed between the two watermarks
-		// for a selected key supersedes the selected row.
-		if err := c.emitWatermark(ctx, chunk.id, "low"); err != nil {
-			clearCurrent()
-			return 0, nil, 0, err
-		}
-
-		selected, err := c.db.SelectChunk(ctx, ref.Schema, ref.Table, pkCols, cursor, c.cfg.ChunkSize)
-		if err != nil {
-			clearCurrent()
-			return 0, nil, 0, err
-		}
-
-		c.mu.Lock()
-		chunk.pending = selected.Rows
-		c.mu.Unlock()
-
-		if err := c.emitWatermark(ctx, chunk.id, "high"); err != nil {
-			clearCurrent()
-			return 0, nil, 0, err
-		}
-
-		select {
-		case <-ctx.Done():
-			clearCurrent()
-			return 0, nil, 0, ctx.Err()
-
-		case <-c.restart:
-			// The replication stream went down mid-chunk; whatever was
-			// partially delivered is covered by idempotent re-emission.
-			clearCurrent()
-			c.logger.Warn("stream restarted mid-chunk, retrying",
-				slog.String("table", ref.String()),
-				slog.String("chunk", chunk.id),
-			)
-			select {
-			case <-ctx.Done():
-				return 0, nil, 0, ctx.Err()
-			case <-time.After(time.Second):
-			}
-			continue
-
-		case <-c.chunkDone:
-			c.mu.Lock()
-			deliveredRows := len(chunk.pending) - len(intersect(chunk.pending, chunk.seen))
-			c.current = nil
-			c.mu.Unlock()
-			return deliveredRows, selected.LastCursor, len(selected.Rows), nil
-		}
+) (*chunkInFlight, error) {
+	if err := c.waitForStream(ctx); err != nil {
+		return nil, err
 	}
+
+	c.mu.Lock()
+	c.chunkSeq++
+	ch := &chunkInFlight{
+		table:   ref,
+		id:      fmt.Sprintf("%s-%s-%d", c.instance, ref.String(), c.chunkSeq),
+		seen:    make(map[string]struct{}),
+		pkCols:  pkCols,
+		done:    make(chan struct{}),
+		restart: c.restart,
+	}
+	c.inflight[ch.id] = ch
+	c.mu.Unlock()
+
+	// DBLog ordering: low watermark, then the chunk select, then the high
+	// watermark. Any event streamed between the two watermarks for a
+	// selected key supersedes the selected row.
+	if err := c.emitWatermark(ctx, ch.id, "low"); err != nil {
+		c.abandon([]*chunkInFlight{ch})
+		return nil, err
+	}
+
+	selected, err := c.db.SelectChunk(ctx, ref.Schema, ref.Table, pkCols, cursor, c.cfg.ChunkSize)
+	if err != nil {
+		c.abandon([]*chunkInFlight{ch})
+		return nil, err
+	}
+
+	c.mu.Lock()
+	ch.pending = selected.Rows
+	ch.rowCount = len(selected.Rows)
+	ch.lastCursor = selected.LastCursor
+	if ch.rowCount == 0 {
+		delete(c.inflight, ch.id)
+		close(ch.done)
+	}
+	c.mu.Unlock()
+	if ch.rowCount == 0 {
+		return ch, nil
+	}
+
+	if err := c.emitWatermark(ctx, ch.id, "high"); err != nil {
+		c.abandon([]*chunkInFlight{ch})
+		return nil, err
+	}
+	return ch, nil
+}
+
+// abandon forgets chunks that will not be awaited; their watermarks, if they
+// still arrive, are ignored.
+func (c *Coordinator) abandon(chunks []*chunkInFlight) {
+	if len(chunks) == 0 {
+		return
+	}
+	c.mu.Lock()
+	for _, ch := range chunks {
+		delete(c.inflight, ch.id)
+	}
+	c.mu.Unlock()
 }
 
 func (c *Coordinator) emitWatermark(ctx context.Context, chunkID, mark string) error {
@@ -602,6 +778,7 @@ func (c *Coordinator) pop() (tableRef, bool) {
 	}
 	ref := c.queue[0]
 	c.queue = c.queue[1:]
+	c.running[ref] = true
 	return ref, true
 }
 
@@ -649,26 +826,17 @@ func splitTableName(name string) (tableRef, bool) {
 	return tableRef{}, false
 }
 
-func intersect(rows []Row, seen map[string]struct{}) []Row {
-	var out []Row
-	for _, r := range rows {
-		if _, ok := seen[r.Key]; ok {
-			out = append(out, r)
-		}
+func newInstanceID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
-	return out
+	return hex.EncodeToString(b[:])
 }
 
 func signal(ch chan struct{}) {
 	select {
 	case ch <- struct{}{}:
-	default:
-	}
-}
-
-func drain(ch chan struct{}) {
-	select {
-	case <-ch:
 	default:
 	}
 }

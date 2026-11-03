@@ -11,12 +11,10 @@ import (
 	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/emoss08/gtc/internal/core/ports"
 	"github.com/emoss08/gtc/internal/infrastructure/metrics"
-	"github.com/sourcegraph/conc/pool"
 )
 
 type CDCServiceConfig struct {
 	ParallelSinks  bool
-	ProcessTimeout time.Duration
 	ExcludedTables map[string]struct{}
 }
 
@@ -61,7 +59,6 @@ func (s *cdcService) Start(ctx context.Context) error {
 
 	s.logger.Info("starting CDC service",
 		slog.Bool("parallel_sinks", s.config.ParallelSinks),
-		slog.Duration("process_timeout", s.config.ProcessTimeout),
 		slog.Int("sink_count", len(sinks)),
 		slog.Any("sinks", sinkNames),
 		slog.Int("excluded_table_count", len(excludedTables)),
@@ -76,7 +73,7 @@ func (s *cdcService) Start(ctx context.Context) error {
 	s.logger.Info("all sinks initialized", slog.Int("count", len(sinks)))
 	metrics.ActiveSinks.Set(float64(len(sinks)))
 
-	return s.walReader.Start(ctx, s.handleEvent)
+	return s.walReader.Start(ctx, s.handleBatch)
 }
 
 func (s *cdcService) Stop(ctx context.Context) error {
@@ -111,63 +108,45 @@ func (s *cdcService) Stop(ctx context.Context) error {
 	return nil
 }
 
-// handleEvent fans an event out to all sinks. It returns an error when any
-// sink fails so the WAL reader does not confirm the transaction's LSN and the
-// event is redelivered after reconnect — sinks must tolerate duplicates
+// handleBatch fans a batch out to all sinks. It returns an error when any
+// sink fails so the WAL reader does not confirm the batch's positions and the
+// events are redelivered after reconnect — sinks must tolerate duplicates
 // (at-least-once delivery).
-func (s *cdcService) handleEvent(ctx context.Context, event domain.CDCEvent) error {
+func (s *cdcService) handleBatch(ctx context.Context, events []domain.CDCEvent) error {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
 	select {
 	case <-s.shutdown:
-		s.logger.Debug("rejecting event due to shutdown",
-			slog.String("event_id", event.ID),
-		)
 		return domain.ErrShuttingDown
 	default:
 	}
 
-	metrics.EventsReceived.WithLabelValues(event.Schema, event.Table, event.Operation.String()).Inc()
-
-	if s.isTableExcluded(event.Schema, event.Table) {
-		metrics.EventsExcluded.WithLabelValues(event.Schema, event.Table).Inc()
-		s.logger.Debug("skipping excluded table",
-			slog.String("table", event.FullTableName()),
-			slog.String("event_id", event.ID),
-		)
+	events = s.admit(events)
+	if len(events) == 0 {
 		return nil
 	}
 
-	metrics.InFlightEvents.Inc()
-	defer metrics.InFlightEvents.Dec()
+	metrics.BatchSize.Observe(float64(len(events)))
+	metrics.InFlightEvents.Add(float64(len(events)))
+	defer metrics.InFlightEvents.Sub(float64(len(events)))
 
-	s.logger.Debug("processing event",
-		slog.String("operation", event.Operation.String()),
-		slog.String("table", event.FullTableName()),
-		slog.String("lsn", event.Metadata.LSN),
-		slog.Int("xid", int(event.Metadata.TransactionID)),
-	)
-
-	results := s.ProcessEvent(ctx, event)
+	results := s.ProcessBatch(ctx, events)
 
 	var errs []error
 	for _, r := range results {
 		if r.Success {
-			s.logger.Debug("sink processed event",
-				slog.String("sink", r.SinkName),
-				slog.String("event_id", event.ID),
-				slog.Duration("duration", r.Duration),
-			)
-		} else {
-			s.logger.Error("sink processing failed",
-				slog.String("sink", r.SinkName),
-				slog.String("error", r.Error.Error()),
-				slog.String("event_id", event.ID),
-				slog.Duration("duration", r.Duration),
-			)
-			errs = append(errs, fmt.Errorf("sink %s: %w", r.SinkName, r.Error))
+			continue
 		}
+		s.logger.Error("sink processing failed",
+			slog.String("sink", r.SinkName),
+			slog.String("error", r.Error.Error()),
+			slog.Int("events", len(events)),
+			slog.String("first_event_id", events[0].ID),
+			slog.String("last_lsn", events[len(events)-1].Metadata.LSN),
+			slog.Duration("duration", r.Duration),
+		)
+		errs = append(errs, fmt.Errorf("sink %s: %w", r.SinkName, r.Error))
 	}
 
 	if len(errs) > 0 {
@@ -176,55 +155,94 @@ func (s *cdcService) handleEvent(ctx context.Context, event domain.CDCEvent) err
 	return nil
 }
 
-func (s *cdcService) ProcessEvent(ctx context.Context, event domain.CDCEvent) []domain.SinkResult {
+type tableOp struct {
+	schema, table, op string
+}
+
+// admit counts the batch per table and operation and drops events of
+// excluded tables, copying only when something is dropped.
+func (s *cdcService) admit(events []domain.CDCEvent) []domain.CDCEvent {
+	received := make(map[tableOp]int, 4)
+	excluded := make(map[tableOp]int)
+	kept := events
+	copied := false
+
+	for i := range events {
+		e := &events[i]
+		key := tableOp{e.Schema, e.Table, e.Operation.String()}
+		received[key]++
+
+		if s.isTableExcluded(e.Schema, e.Table) {
+			excluded[tableOp{schema: e.Schema, table: e.Table}]++
+			if !copied {
+				kept = append(make([]domain.CDCEvent, 0, len(events)), events[:i]...)
+				copied = true
+			}
+			continue
+		}
+		if copied {
+			kept = append(kept, *e)
+		}
+	}
+
+	for k, n := range received {
+		metrics.EventsReceived.WithLabelValues(k.schema, k.table, k.op).Add(float64(n))
+	}
+	for k, n := range excluded {
+		metrics.EventsExcluded.WithLabelValues(k.schema, k.table).Add(float64(n))
+	}
+	return kept
+}
+
+func (s *cdcService) ProcessBatch(ctx context.Context, events []domain.CDCEvent) []domain.SinkResult {
 	sinks := s.registry.All()
 	results := make([]domain.SinkResult, len(sinks))
 
 	if len(sinks) == 0 {
-		s.logger.Warn("no sinks registered, event will not be persisted",
-			slog.String("event_id", event.ID),
+		s.logger.Warn("no sinks registered, events will not be persisted",
+			slog.Int("events", len(events)),
 		)
 		return results
 	}
 
-	if s.config.ParallelSinks {
-		p := pool.New().WithContext(ctx)
+	if s.config.ParallelSinks && len(sinks) > 1 {
+		var wg sync.WaitGroup
 		for i, sink := range sinks {
-			idx, snk := i, sink
-			p.Go(func(ctx context.Context) error {
-				results[idx] = s.processSingleSink(ctx, snk, event)
-				return nil
-			})
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results[i] = s.processSink(ctx, sink, events)
+			}()
 		}
-		_ = p.Wait()
+		wg.Wait()
 	} else {
 		for i, sink := range sinks {
-			results[i] = s.processSingleSink(ctx, sink, event)
+			results[i] = s.processSink(ctx, sink, events)
 		}
 	}
 
 	return results
 }
 
-func (s *cdcService) processSingleSink(
+// processSink delivers the batch to one sink. Attempts are bounded by the
+// resilience layer's per-attempt timeout; the stream's keepalives continue
+// while sinks work, so a long delivery cannot time the replication
+// connection out.
+func (s *cdcService) processSink(
 	ctx context.Context,
 	sink domain.Sink,
-	event domain.CDCEvent,
+	events []domain.CDCEvent,
 ) domain.SinkResult {
 	start := time.Now()
-
-	ctx, cancel := context.WithTimeout(ctx, s.config.ProcessTimeout)
-	defer cancel()
-
-	err := sink.Process(ctx, event)
+	err := deliver(ctx, sink, events)
 	duration := time.Since(start)
 
-	metrics.EventProcessingDuration.WithLabelValues(sink.Name()).Observe(duration.Seconds())
+	metrics.SinkBatchDuration.WithLabelValues(sink.Name()).Observe(duration.Seconds())
 	if err != nil {
-		metrics.EventsProcessed.WithLabelValues(sink.Name(), "failure").Inc()
+		metrics.EventsProcessed.WithLabelValues(sink.Name(), "failure").Add(float64(len(events)))
 		metrics.SinkErrors.WithLabelValues(sink.Name(), classifyError(err)).Inc()
 	} else {
-		metrics.EventsProcessed.WithLabelValues(sink.Name(), "success").Inc()
+		metrics.EventsProcessed.WithLabelValues(sink.Name(), "success").Add(float64(len(events)))
 	}
 
 	return domain.SinkResult{
@@ -235,10 +253,27 @@ func (s *cdcService) processSingleSink(
 	}
 }
 
+// deliver hands the batch over in pieces no larger than the sink's own
+// delivery unit, in order, stopping at the first failure.
+func deliver(ctx context.Context, sink domain.Sink, events []domain.CDCEvent) error {
+	limit := domain.MaxBatchEvents(sink)
+	if limit <= 0 || len(events) <= limit {
+		return sink.Process(ctx, events)
+	}
+	for start := 0; start < len(events); start += limit {
+		if err := sink.Process(ctx, events[start:min(start+limit, len(events))]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func classifyError(err error) string {
 	switch {
 	case errors.Is(err, domain.ErrCircuitOpen):
 		return "circuit_open"
+	case domain.IsPermanent(err):
+		return "permanent"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout"
 	case errors.Is(err, context.Canceled):
@@ -253,14 +288,9 @@ func (s *cdcService) isTableExcluded(schema, table string) bool {
 		return false
 	}
 
-	fullName := schema + "." + table
-	if _, ok := s.config.ExcludedTables[fullName]; ok {
-		return true
-	}
-
 	if _, ok := s.config.ExcludedTables[table]; ok {
 		return true
 	}
-
-	return false
+	_, ok := s.config.ExcludedTables[schema+"."+table]
+	return ok
 }

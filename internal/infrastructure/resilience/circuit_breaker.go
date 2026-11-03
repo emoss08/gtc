@@ -12,6 +12,8 @@ import (
 )
 
 type ResilienceConfig struct {
+	// AttemptTimeout bounds each delivery attempt of a batch.
+	AttemptTimeout      time.Duration
 	MaxRetries          int
 	InitialBackoff      time.Duration
 	MaxBackoff          time.Duration
@@ -21,6 +23,7 @@ type ResilienceConfig struct {
 
 func DefaultResilienceConfig() ResilienceConfig {
 	return ResilienceConfig{
+		AttemptTimeout:      30 * time.Second,
 		MaxRetries:          3,
 		InitialBackoff:      100 * time.Millisecond,
 		MaxBackoff:          5 * time.Second,
@@ -45,6 +48,12 @@ func NewResilientSink(sink domain.Sink, cfg ResilienceConfig) *ResilientSink {
 		Timeout: cfg.CircuitOpenDuration,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
 			return counts.ConsecutiveFailures >= cfg.FailureThreshold
+		},
+		// Only destination failures count toward tripping: a permanent
+		// (data) error says nothing about the sink's health, and a
+		// cancellation is shutdown.
+		IsSuccessful: func(err error) bool {
+			return err == nil || domain.IsPermanent(err) || errors.Is(err, context.Canceled)
 		},
 		OnStateChange: func(name string, _, to gobreaker.State) {
 			metrics.CircuitBreakerState.WithLabelValues(name).Set(breakerStateValue(to))
@@ -77,9 +86,12 @@ func (s *ResilientSink) Initialize(ctx context.Context) error {
 	return s.inner.Initialize(ctx)
 }
 
-func (s *ResilientSink) Process(ctx context.Context, event domain.CDCEvent) error {
+func (s *ResilientSink) Process(ctx context.Context, events []domain.CDCEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
 	_, err := s.breaker.Execute(func() (any, error) {
-		return nil, s.processWithRetry(ctx, event)
+		return nil, s.processWithRetry(ctx, events)
 	})
 	if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
 		return fmt.Errorf("%w: %s", domain.ErrCircuitOpen, err)
@@ -87,19 +99,19 @@ func (s *ResilientSink) Process(ctx context.Context, event domain.CDCEvent) erro
 	return err
 }
 
-func (s *ResilientSink) processWithRetry(ctx context.Context, event domain.CDCEvent) error {
+func (s *ResilientSink) processWithRetry(ctx context.Context, events []domain.CDCEvent) error {
 	backoff := s.config.InitialBackoff
 	var lastErr error
 
 	for i := 0; i <= s.config.MaxRetries; i++ {
-		lastErr = s.inner.Process(ctx, event)
+		lastErr = s.attempt(ctx, events)
 		if lastErr == nil {
 			return nil
 		}
 
-		// Retrying after the context is done cannot succeed; surface the
-		// underlying failure immediately.
-		if ctx.Err() != nil || i == s.config.MaxRetries {
+		// Retrying a permanent failure or after the context is done
+		// cannot succeed; surface it immediately.
+		if domain.IsPermanent(lastErr) || ctx.Err() != nil || i == s.config.MaxRetries {
 			return lastErr
 		}
 
@@ -113,6 +125,21 @@ func (s *ResilientSink) processWithRetry(ctx context.Context, event domain.CDCEv
 	}
 
 	return lastErr
+}
+
+func (s *ResilientSink) attempt(ctx context.Context, events []domain.CDCEvent) error {
+	if s.config.AttemptTimeout <= 0 {
+		return s.inner.Process(ctx, events)
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.config.AttemptTimeout)
+	defer cancel()
+	return s.inner.Process(ctx, events)
+}
+
+func (s *ResilientSink) MaxBatchEvents() int { return domain.MaxBatchEvents(s.inner) }
+
+func (s *ResilientSink) Wants(schema, table string, op domain.Operation) bool {
+	return domain.Wants(s.inner, schema, table, op)
 }
 
 func (s *ResilientSink) Shutdown(ctx context.Context) error {

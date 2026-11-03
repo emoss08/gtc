@@ -80,8 +80,11 @@ type Chain struct {
 
 type compiledSpec struct {
 	filter cel.Program
-	drop   map[string]struct{}
-	mask   map[string]maskFunc
+	// partial evaluates the filter with the row unknown, to decide statically
+	// whether a table/operation can pass at all.
+	partial cel.Program
+	drop    map[string]struct{}
+	mask    map[string]maskFunc
 }
 
 // Compile validates and compiles transform specs into a Chain. A nil Chain
@@ -124,6 +127,11 @@ func CompileWithOptions(opts Options, specs ...config.TransformSpec) (*Chain, er
 				return nil, fmt.Errorf("build filter program %q: %w", spec.Filter, err)
 			}
 			step.filter = prg
+			partial, err := env.Program(ast, cel.EvalOptions(cel.OptPartialEval))
+			if err != nil {
+				return nil, fmt.Errorf("build partial filter program %q: %w", spec.Filter, err)
+			}
+			step.partial = partial
 		}
 
 		if len(spec.DropColumns) > 0 {
@@ -193,6 +201,37 @@ func (c *Chain) Apply(event domain.CDCEvent) (domain.CDCEvent, bool, error) {
 	}
 
 	return event, true, nil
+}
+
+// RejectsAll reports whether the chain drops every event of op for
+// schema.table whatever the row holds: a filter that is false with only the
+// operation and table known. A filter that depends on row data, or fails to
+// evaluate, does not reject statically.
+func (c *Chain) RejectsAll(schema, table string, op domain.Operation) bool {
+	if c == nil {
+		return false
+	}
+	for _, step := range c.steps {
+		if step.partial == nil {
+			continue
+		}
+		vars, err := cel.PartialVars(map[string]any{
+			"op":     op.String(),
+			"schema": schema,
+			"table":  table,
+		}, cel.AttributePattern("new"), cel.AttributePattern("old"))
+		if err != nil {
+			return false
+		}
+		out, _, err := step.partial.Eval(vars)
+		if err != nil {
+			continue
+		}
+		if keep, ok := out.(types.Bool); ok && !bool(keep) {
+			return true
+		}
+	}
+	return false
 }
 
 func evalFilter(prg cel.Program, event domain.CDCEvent) (bool, error) {

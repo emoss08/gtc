@@ -219,18 +219,20 @@ lives in an optional YAML file.
 | `CDC_AUTO_CREATE_SLOT` | `true` | Create the slot if missing |
 | `CDC_AUTO_CREATE_PUBLICATION` | `true` | Create the publication (`FOR ALL TABLES`) if missing |
 | `CDC_STANDBY_TIMEOUT` | `10s` | Standby keepalive interval |
-| `CDC_PARALLEL_SINKS` | `false` | Process sinks concurrently per event |
-| `CDC_PROCESS_TIMEOUT` | `10s` | Per-sink, per-event timeout (keep sink-count × timeout under `wal_sender_timeout`) |
+| `CDC_PARALLEL_SINKS` | `true` | Deliver each batch to all sinks concurrently |
+| `CDC_PROCESS_TIMEOUT` | `30s` | Timeout of one delivery attempt of one batch to one sink (keepalives continue meanwhile) |
+| `CDC_BATCH_MAX_EVENTS` | `5000` | Most events handed to the sinks at once |
+| `CDC_BATCH_LINGER` | `10ms` | Longest an event waits for its batch to fill when the stream is quiet |
 | `CDC_EXCLUDED_TABLES` | – | Comma-separated tables to skip (`public.migrations,audit_logs`) |
 | `CDC_SLOT_RETRY_INTERVAL` | `5s` | Wait between retries when the slot is busy |
 | `CDC_SLOT_RETRY_TIMEOUT` | `60s` | Give up starting replication after this long |
-| `CDC_MAX_RETRIES` | `3` | Per-sink retries before an event fails |
+| `CDC_MAX_RETRIES` | `3` | Per-sink retries before a batch fails |
 | `CDC_RETRY_BACKOFF_INITIAL` | `100ms` | Initial retry backoff |
 | `CDC_RETRY_BACKOFF_MAX` | `10s` | Maximum retry backoff |
 | `CDC_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before the circuit opens |
 | `CDC_CIRCUIT_BREAKER_TIMEOUT` | `30s` | How long an open circuit stays open |
 | `CDC_BACKFILL_MODE` | `auto` | `auto` backfills all tables when the slot is first created; `manual` via API only; `off` disables |
-| `CDC_BACKFILL_CHUNK_SIZE` | `1000` | Rows per backfill chunk |
+| `CDC_BACKFILL_CHUNK_SIZE` | `5000` | Rows per backfill chunk (a shorter chunk ends the table) |
 | `CDC_BACKFILL_CHUNK_DELAY` | `0` | Pause between chunks (throttle source load) |
 | `CDC_BACKFILL_STATE_TABLE` | `gtc_backfill_state` | Progress table in the source DB (`none` disables resume) |
 | `CDC_DLQ_ENABLED` | `true` | Park poison events in Redis instead of stalling forever (needs `REDIS_URL`) |

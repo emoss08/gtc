@@ -24,14 +24,23 @@ var (
 		[]string{"sink", "status"},
 	)
 
-	EventProcessingDuration = promauto.NewHistogramVec(
+	SinkBatchDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "cdc",
-			Name:      "event_processing_duration_seconds",
-			Help:      "Duration of event processing by sink",
-			Buckets:   prometheus.DefBuckets,
+			Name:      "sink_batch_duration_seconds",
+			Help:      "Duration of delivering one batch to a sink, retries included",
+			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 16),
 		},
 		[]string{"sink"},
+	)
+
+	BatchSize = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "cdc",
+			Name:      "batch_events",
+			Help:      "Number of events per batch handed to the sinks",
+			Buckets:   prometheus.ExponentialBuckets(1, 2, 15),
+		},
 	)
 
 	SinkErrors = promauto.NewCounterVec(

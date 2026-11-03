@@ -84,7 +84,7 @@ func TestPublishesToJetStream(t *testing.T) {
 	srv := runServer(t)
 	sink := newSink(t, testConfig(srv.ClientURL()), nil)
 
-	if err := sink.Process(context.Background(), testEvent()); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err != nil {
 		t.Fatalf("process: %v", err)
 	}
 
@@ -108,7 +108,7 @@ func TestRedeliveryIsDeduplicatedByLSN(t *testing.T) {
 	sink := newSink(t, testConfig(srv.ClientURL()), nil)
 
 	for range 3 {
-		if err := sink.Process(context.Background(), testEvent()); err != nil {
+		if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err != nil {
 			t.Fatalf("process: %v", err)
 		}
 	}
@@ -127,7 +127,7 @@ func TestDistinctEventsAreAllPublished(t *testing.T) {
 		event.ID = id
 		event.Metadata.LSN = id
 		event.NewData = map[string]any{"id": i}
-		if err := sink.Process(context.Background(), event); err != nil {
+		if err := sink.Process(context.Background(), []domain.CDCEvent{event}); err != nil {
 			t.Fatalf("process %s: %v", id, err)
 		}
 	}
@@ -187,7 +187,7 @@ func TestCoreNATSPublishWithoutJetStream(t *testing.T) {
 	}
 
 	sink := newSink(t, cfg, nil)
-	if err := sink.Process(context.Background(), testEvent()); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err != nil {
 		t.Fatalf("process: %v", err)
 	}
 
@@ -218,7 +218,7 @@ func TestResolverControlsSubject(t *testing.T) {
 	srv := runServer(t)
 	sink := newSink(t, testConfig(srv.ClientURL()), resolver{subject: "cdc.custom.route"})
 
-	if err := sink.Process(context.Background(), testEvent()); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err != nil {
 		t.Fatalf("process: %v", err)
 	}
 	if msg := fetchOne(t, srv.ClientURL(), "GTC_TEST", "cdc.custom.route"); len(msg) == 0 {
@@ -230,7 +230,7 @@ func TestFilteredTableIsSkipped(t *testing.T) {
 	srv := runServer(t)
 	sink := newSink(t, testConfig(srv.ClientURL()), resolver{skip: true})
 
-	if err := sink.Process(context.Background(), testEvent()); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err != nil {
 		t.Fatalf("a filtered event must be skipped, not fail: %v", err)
 	}
 	if got := streamMessages(t, srv.ClientURL(), "GTC_TEST"); got != 0 {
@@ -243,7 +243,7 @@ func TestPublishFailsWhenServerIsGone(t *testing.T) {
 	sink := newSink(t, testConfig(srv.ClientURL()), nil)
 	srv.Shutdown()
 
-	if err := sink.Process(context.Background(), testEvent()); err == nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{testEvent()}); err == nil {
 		t.Fatal("publishing to a downed server must fail so the event is retried")
 	}
 }
@@ -290,7 +290,7 @@ func TestWildcardTableNameIsPublishable(t *testing.T) {
 
 	event := testEvent()
 	event.Table = "we*rd"
-	if err := sink.Process(context.Background(), event); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{event}); err != nil {
 		t.Fatalf("a table name with a wildcard must still publish: %v", err)
 	}
 	if msg := fetchOne(t, srv.ClientURL(), "GTC_TEST", "cdc.public.we_rd"); len(msg) == 0 {

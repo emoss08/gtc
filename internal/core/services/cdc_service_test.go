@@ -21,14 +21,14 @@ func (s *fakeSink) Name() string                      { return s.name }
 func (s *fakeSink) Initialize(context.Context) error  { return nil }
 func (s *fakeSink) Shutdown(context.Context) error    { return nil }
 func (s *fakeSink) HealthCheck(context.Context) error { return nil }
-func (s *fakeSink) Process(context.Context, domain.CDCEvent) error {
-	s.processed++
+func (s *fakeSink) Process(_ context.Context, events []domain.CDCEvent) error {
+	s.processed += len(events)
 	return s.processErr
 }
 
 type fakeWALReader struct{}
 
-func (fakeWALReader) Start(context.Context, ports.WALEventHandler) error { return nil }
+func (fakeWALReader) Start(context.Context, ports.WALBatchHandler) error { return nil }
 func (fakeWALReader) Stop(context.Context) error                         { return nil }
 func (fakeWALReader) CurrentLSN() string                                 { return "0/0" }
 
@@ -52,12 +52,12 @@ func testEvent(schema, table string) domain.CDCEvent {
 	}
 }
 
-func TestHandleEventPropagatesSinkFailure(t *testing.T) {
+func TestHandleBatchPropagatesSinkFailure(t *testing.T) {
 	failing := &fakeSink{name: "bad", processErr: errors.New("connection refused")}
 	healthy := &fakeSink{name: "good"}
-	svc := newTestService(t, CDCServiceConfig{ProcessTimeout: time.Second}, failing, healthy)
+	svc := newTestService(t, CDCServiceConfig{}, failing, healthy)
 
-	err := svc.handleEvent(context.Background(), testEvent("public", "users"))
+	err := svc.handleBatch(context.Background(), []domain.CDCEvent{testEvent("public", "users")})
 	if err == nil {
 		t.Fatal("expected error when a sink fails; a nil return would confirm the LSN and lose the event")
 	}
@@ -69,11 +69,11 @@ func TestHandleEventPropagatesSinkFailure(t *testing.T) {
 	}
 }
 
-func TestHandleEventSucceedsWhenAllSinksSucceed(t *testing.T) {
+func TestHandleBatchSucceedsWhenAllSinksSucceed(t *testing.T) {
 	sink := &fakeSink{name: "good"}
-	svc := newTestService(t, CDCServiceConfig{ProcessTimeout: time.Second}, sink)
+	svc := newTestService(t, CDCServiceConfig{}, sink)
 
-	if err := svc.handleEvent(context.Background(), testEvent("public", "users")); err != nil {
+	if err := svc.handleBatch(context.Background(), []domain.CDCEvent{testEvent("public", "users")}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if sink.processed != 1 {
@@ -81,10 +81,9 @@ func TestHandleEventSucceedsWhenAllSinksSucceed(t *testing.T) {
 	}
 }
 
-func TestHandleEventSkipsExcludedTables(t *testing.T) {
+func TestHandleBatchSkipsExcludedTables(t *testing.T) {
 	sink := &fakeSink{name: "good"}
 	svc := newTestService(t, CDCServiceConfig{
-		ProcessTimeout: time.Second,
 		ExcludedTables: map[string]struct{}{"public.migrations": {}, "audit_logs": {}},
 	}, sink)
 
@@ -92,7 +91,7 @@ func TestHandleEventSkipsExcludedTables(t *testing.T) {
 		{"public", "migrations"}, // full-name match
 		{"other", "audit_logs"},  // bare-name match
 	} {
-		if err := svc.handleEvent(context.Background(), testEvent(tc.schema, tc.table)); err != nil {
+		if err := svc.handleBatch(context.Background(), []domain.CDCEvent{testEvent(tc.schema, tc.table)}); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	}
@@ -101,9 +100,9 @@ func TestHandleEventSkipsExcludedTables(t *testing.T) {
 	}
 }
 
-func TestHandleEventRejectsDuringShutdown(t *testing.T) {
+func TestHandleBatchRejectsDuringShutdown(t *testing.T) {
 	sink := &fakeSink{name: "good"}
-	svc := newTestService(t, CDCServiceConfig{ProcessTimeout: time.Second}, sink)
+	svc := newTestService(t, CDCServiceConfig{}, sink)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -111,7 +110,7 @@ func TestHandleEventRejectsDuringShutdown(t *testing.T) {
 		t.Fatalf("stop failed: %v", err)
 	}
 
-	err := svc.handleEvent(context.Background(), testEvent("public", "users"))
+	err := svc.handleBatch(context.Background(), []domain.CDCEvent{testEvent("public", "users")})
 	if !errors.Is(err, domain.ErrShuttingDown) {
 		t.Fatalf("expected ErrShuttingDown so the LSN is not confirmed, got %v", err)
 	}

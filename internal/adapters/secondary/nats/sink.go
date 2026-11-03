@@ -58,6 +58,10 @@ func NewSink(p SinkParams) *Sink {
 
 func (s *Sink) Name() string { return "nats" }
 
+func (s *Sink) Wants(schema, table string, _ domain.Operation) bool {
+	return s.resolver == nil || s.resolver.ShouldProcess(schema, table)
+}
+
 func (s *Sink) Initialize(ctx context.Context) error {
 	opts := []nats.Option{
 		nats.Name("gtc"),
@@ -86,7 +90,7 @@ func (s *Sink) Initialize(ctx context.Context) error {
 	s.conn = conn
 
 	if s.config.JetStream {
-		js, err := jetstream.New(conn)
+		js, err := jetstream.New(conn, jetstream.WithPublishAsyncMaxPending(2*publishWindow))
 		if err != nil {
 			conn.Close()
 			return fmt.Errorf("initialize JetStream: %w", err)
@@ -179,18 +183,90 @@ type metadata struct {
 	Timestamp     time.Time `json:"timestamp"`
 }
 
-func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
-	if s.resolver != nil && !s.resolver.ShouldProcess(event.Schema, event.Table) {
-		s.logger.Debug("skipping event, table not configured",
-			slog.String("table", event.FullTableName()),
-			slog.String("event_id", event.ID),
-		)
+// publishWindow bounds how many JetStream publishes are awaiting an ack at
+// once, below the client's async pending limit.
+const publishWindow = 1024
+
+// Process publishes the batch. JetStream publishes are pipelined in windows
+// and the batch succeeds once every message is acknowledged as persisted;
+// core NATS publishes are flushed once per batch. Async publishes are not
+// retried individually: a failure fails the batch, which is redelivered and
+// deduplicated by message ID.
+func (s *Sink) Process(ctx context.Context, events []domain.CDCEvent) error {
+	msgs := make([]*nats.Msg, 0, len(events))
+	ids := make([]string, 0, len(events))
+	for i := range events {
+		event := &events[i]
+		if s.resolver != nil && !s.resolver.ShouldProcess(event.Schema, event.Table) {
+			continue
+		}
+		msg, err := s.message(*event)
+		if err != nil {
+			return domain.Permanent(err)
+		}
+		msgs = append(msgs, msg)
+		ids = append(ids, event.ID)
+	}
+	if len(msgs) == 0 {
 		return nil
 	}
 
+	if s.js == nil {
+		for _, msg := range msgs {
+			if err := s.conn.PublishMsg(msg); err != nil {
+				return fmt.Errorf("publish %s: %w", msg.Subject, err)
+			}
+		}
+		// FlushWithContext refuses a context without a deadline.
+		flushCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+		defer cancel()
+		if err := s.conn.FlushWithContext(flushCtx); err != nil {
+			return fmt.Errorf("flush %d messages: %w", len(msgs), err)
+		}
+		return nil
+	}
+
+	for start := 0; start < len(msgs); start += publishWindow {
+		end := min(start+publishWindow, len(msgs))
+		if err := s.publishWindow(ctx, msgs[start:end], ids[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Sink) publishWindow(ctx context.Context, msgs []*nats.Msg, ids []string) error {
+	ctx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+	defer cancel()
+
+	futures := make([]jetstream.PubAckFuture, len(msgs))
+	for i, msg := range msgs {
+		f, err := s.js.PublishMsgAsync(msg,
+			jetstream.WithMsgID(ids[i]),
+			jetstream.WithRetryAttempts(0),
+		)
+		if err != nil {
+			return fmt.Errorf("publish %s: %w", msg.Subject, err)
+		}
+		futures[i] = f
+	}
+
+	for i, f := range futures {
+		select {
+		case <-f.Ok():
+		case err := <-f.Err():
+			return fmt.Errorf("publish %s (event %s): %w", msgs[i].Subject, ids[i], err)
+		case <-ctx.Done():
+			return fmt.Errorf("await publish acks: %w", ctx.Err())
+		}
+	}
+	return nil
+}
+
+func (s *Sink) message(event domain.CDCEvent) (*nats.Msg, error) {
 	subject, err := s.subject(event)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	data, err := sonic.Marshal(payload{
@@ -208,35 +284,9 @@ func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
+		return nil, fmt.Errorf("marshal payload for event %s: %w", event.ID, err)
 	}
-
-	if s.js != nil {
-		ctx, cancel := context.WithTimeout(ctx, s.config.Timeout)
-		defer cancel()
-		// The LSN is stable across redelivery, so JetStream deduplicates
-		// replays of the same event within the stream's duplicate window.
-		if _, err := s.js.Publish(ctx, subject, data,
-			jetstream.WithMsgID(event.ID)); err != nil {
-			return fmt.Errorf("publish %s: %w", subject, err)
-		}
-	} else {
-		if err := s.conn.Publish(subject, data); err != nil {
-			return fmt.Errorf("publish %s: %w", subject, err)
-		}
-		// Core NATS is fire-and-forget; flushing at least confirms the
-		// server accepted the bytes before the LSN is advanced.
-		if err := s.conn.FlushTimeout(s.config.Timeout); err != nil {
-			return fmt.Errorf("flush %s: %w", subject, err)
-		}
-	}
-
-	s.logger.Debug("event published",
-		slog.String("subject", subject),
-		slog.String("event_id", event.ID),
-		slog.String("operation", event.Operation.String()),
-	)
-	return nil
+	return &nats.Msg{Subject: subject, Data: data}, nil
 }
 
 func (s *Sink) subject(event domain.CDCEvent) (string, error) {

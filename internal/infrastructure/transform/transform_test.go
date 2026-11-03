@@ -233,8 +233,8 @@ func (s *captureSink) Name() string                      { return "capture" }
 func (s *captureSink) Initialize(context.Context) error  { return nil }
 func (s *captureSink) Shutdown(context.Context) error    { return nil }
 func (s *captureSink) HealthCheck(context.Context) error { return nil }
-func (s *captureSink) Process(_ context.Context, e domain.CDCEvent) error {
-	s.events = append(s.events, e)
+func (s *captureSink) Process(_ context.Context, events []domain.CDCEvent) error {
+	s.events = append(s.events, events...)
 	return nil
 }
 
@@ -251,9 +251,9 @@ func TestSinkAppliesGlobalThenTableChain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = sink.Process(context.Background(), event(domain.OperationInsert, map[string]any{
+	err = sink.Process(context.Background(), []domain.CDCEvent{event(domain.OperationInsert, map[string]any{
 		"id": 1, "email": "a@b.c", "password_hash": "x",
-	}, nil))
+	}, nil)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,8 +277,7 @@ func TestSinkFiltersEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := sink.Process(context.Background(),
-		event(domain.OperationDelete, nil, map[string]any{"id": 1})); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{event(domain.OperationDelete, nil, map[string]any{"id": 1})}); err != nil {
 		t.Fatal(err)
 	}
 	if len(inner.events) != 0 {

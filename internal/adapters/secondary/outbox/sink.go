@@ -38,7 +38,9 @@ type Sink struct {
 	cfg    Config
 	client *redis.Client
 	pool   *pgxpool.Pool // nil unless DeleteAfterPublish
-	logger *slog.Logger
+	// deleteSQL removes a batch of published rows by id; set with pool.
+	deleteSQL string
+	logger    *slog.Logger
 }
 
 var _ domain.Sink = (*Sink)(nil)
@@ -61,6 +63,11 @@ func NewSink(cfg Config, logger *slog.Logger) (*Sink, error) {
 
 func (s *Sink) Name() string { return "outbox" }
 
+// Wants: only inserts into the outbox table are messages.
+func (s *Sink) Wants(schema, table string, op domain.Operation) bool {
+	return schema == s.cfg.Schema && table == s.cfg.Table && op == domain.OperationInsert
+}
+
 func (s *Sink) Initialize(ctx context.Context) error {
 	if err := s.client.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("outbox: redis ping failed: %w", err)
@@ -72,6 +79,22 @@ func (s *Sink) Initialize(ctx context.Context) error {
 			return fmt.Errorf("outbox: connect for delete-after-publish: %w", err)
 		}
 		s.pool = pool
+
+		// The ids arrive as text; casting the array to the column's own
+		// type keeps the delete on the primary key index.
+		var idType string
+		if err := pool.QueryRow(ctx,
+			"SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = $1::regclass AND attname = $2 AND NOT attisdropped",
+			pgx.Identifier{s.cfg.Schema, s.cfg.Table}.Sanitize(), s.cfg.Columns.ID,
+		).Scan(&idType); err != nil {
+			pool.Close()
+			return fmt.Errorf("outbox: resolve type of id column %q: %w", s.cfg.Columns.ID, err)
+		}
+		s.deleteSQL = fmt.Sprintf("DELETE FROM %s WHERE %s = ANY($1::text[]::%s[])",
+			pgx.Identifier{s.cfg.Schema, s.cfg.Table}.Sanitize(),
+			pgx.Identifier{s.cfg.Columns.ID}.Sanitize(),
+			idType,
+		)
 	}
 
 	s.logger.Info("outbox sink initialized",
@@ -82,44 +105,53 @@ func (s *Sink) Initialize(ctx context.Context) error {
 	return nil
 }
 
-func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
-	if event.Schema != s.cfg.Schema || event.Table != s.cfg.Table {
+// Process publishes the batch's outbox rows in one pipelined round trip and,
+// with delete-after-publish, removes them with one statement.
+func (s *Sink) Process(ctx context.Context, events []domain.CDCEvent) error {
+	pipe := s.client.Pipeline()
+	var published []any
+
+	for i := range events {
+		event := &events[i]
+		if event.Schema != s.cfg.Schema || event.Table != s.cfg.Table {
+			continue
+		}
+		if event.Operation != domain.OperationInsert {
+			continue
+		}
+
+		streamKey, fields, err := buildMessage(s.cfg, *event)
+		if err != nil {
+			return domain.Permanent(err)
+		}
+		pipe.XAdd(ctx, &redis.XAddArgs{
+			Stream: streamKey,
+			MaxLen: s.cfg.MaxStreamLen,
+			Approx: true,
+			Values: fields,
+		})
+		if id, ok := event.NewData[s.cfg.Columns.ID]; ok && id != nil {
+			published = append(published, id)
+		} else if s.cfg.DeleteAfterPublish {
+			s.logger.Warn("cannot delete published outbox row, no id column",
+				slog.String("event_id", event.ID))
+		}
+	}
+
+	queued := pipe.Len()
+	if queued == 0 {
 		return nil
 	}
-	// Only new outbox entries become messages. Updates and deletes are
-	// housekeeping (including our own delete-after-publish), and READ
-	// events from a backfill would republish historical messages.
-	if event.Operation != domain.OperationInsert {
-		return nil
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("outbox: publish %d messages: %w", queued, err)
 	}
 
-	streamKey, fields, err := buildMessage(s.cfg, event)
-	if err != nil {
-		return err
-	}
-
-	if err := s.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: streamKey,
-		MaxLen: s.cfg.MaxStreamLen,
-		Approx: true,
-		Values: fields,
-	}).Err(); err != nil {
-		return fmt.Errorf("outbox: publish to %s: %w", streamKey, err)
-	}
-
-	s.logger.Debug("outbox message published",
-		slog.String("stream", streamKey),
-		slog.Any("id", fields["id"]),
-	)
-
-	if s.cfg.DeleteAfterPublish {
-		s.deleteRow(ctx, event)
+	if s.cfg.DeleteAfterPublish && len(published) > 0 {
+		s.deleteRows(ctx, published)
 	}
 	return nil
 }
 
-// buildMessage resolves the destination stream and message fields for one
-// outbox row. Split out for testability.
 func buildMessage(cfg Config, event domain.CDCEvent) (string, map[string]any, error) {
 	row := event.NewData
 
@@ -162,25 +194,16 @@ func buildMessage(cfg Config, event domain.CDCEvent) (string, map[string]any, er
 	return cfg.StreamPrefix + ":" + topic, fields, nil
 }
 
-func (s *Sink) deleteRow(ctx context.Context, event domain.CDCEvent) {
-	id, ok := event.NewData[s.cfg.Columns.ID]
-	if !ok || id == nil {
-		s.logger.Warn("cannot delete published outbox row, no id column",
-			slog.String("event_id", event.ID))
-		return
+// deleteRows removes published rows. Failure only leaves rows behind (they
+// were already published), so it is logged rather than failing the batch.
+func (s *Sink) deleteRows(ctx context.Context, ids []any) {
+	keys := make([]string, len(ids))
+	for i, id := range ids {
+		keys[i] = fmt.Sprintf("%v", id)
 	}
-
-	// Deletion is housekeeping: the message is already published, so a
-	// failure here must not fail (and redeliver) the event. Leftover rows
-	// are harmless and can be swept by any cleanup job.
-	query := fmt.Sprintf("DELETE FROM %s.%s WHERE %s = $1",
-		pgx.Identifier{s.cfg.Schema}.Sanitize(),
-		pgx.Identifier{s.cfg.Table}.Sanitize(),
-		pgx.Identifier{s.cfg.Columns.ID}.Sanitize(),
-	)
-	if _, err := s.pool.Exec(ctx, query, fmt.Sprintf("%v", id)); err != nil {
-		s.logger.Warn("failed to delete published outbox row",
-			slog.Any("id", id),
+	if _, err := s.pool.Exec(ctx, s.deleteSQL, keys); err != nil {
+		s.logger.Warn("failed to delete published outbox rows",
+			slog.Int("rows", len(keys)),
 			slog.String("error", err.Error()),
 		)
 	}

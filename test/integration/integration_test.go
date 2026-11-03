@@ -44,6 +44,11 @@ const (
 	stateTable  = "gtc_it_backfill_state"
 	natsStream  = "GTC_IT"
 	stream      = prefix + ":public:" + table
+	bulkTable   = "gtc_it_bulk"
+	bulkStream  = prefix + ":public:" + bulkTable
+	// bulkRows is large enough that backfill spans several chunks and the
+	// live bulk insert spans several batches inside one transaction.
+	bulkRows = 20000
 )
 
 // webhookReceiver is a real HTTP endpoint the gateway subprocess delivers to.
@@ -132,6 +137,7 @@ func TestEndToEnd(t *testing.T) {
 
 	cleanup := func() {
 		_, _ = db.Exec(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+		_, _ = db.Exec(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", bulkTable))
 		// The backfill resume state must not leak between runs, or the
 		// second run would consider the table already backfilled.
 		_, _ = db.Exec(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", stateTable))
@@ -139,7 +145,7 @@ func TestEndToEnd(t *testing.T) {
 		_, _ = db.Exec(context.Background(),
 			"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
 			slotName)
-		_ = rdb.Del(context.Background(), stream, prefix+":schema").Err()
+		_ = rdb.Del(context.Background(), stream, bulkStream, prefix+":schema").Err()
 	}
 	cleanup()          // leftovers from an aborted previous run
 	t.Cleanup(cleanup) // called after the gateway has been stopped
@@ -154,6 +160,12 @@ func TestEndToEnd(t *testing.T) {
 			i, fmt.Sprintf("seed-%d", i), fmt.Sprintf("seed-%d@example.com", i))
 	}
 
+	// A large table that also exists before the slot: its backfill spans
+	// several chunks.
+	mustExec(t, ctx, db, fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, payload text)", bulkTable))
+	mustExec(t, ctx, db, fmt.Sprintf(
+		"INSERT INTO %s SELECT g, md5(g::text) FROM generate_series(1, %d) g", bulkTable, bulkRows))
+
 	bin := buildGateway(t, ctx)
 
 	// Preflight: `gtc doctor` must pass against a correctly provisioned
@@ -164,6 +176,8 @@ func TestEndToEnd(t *testing.T) {
 	hook := startWebhookReceiver(t)
 	natsURL := os.Getenv("GTC_TEST_NATS_URL")
 	gw := startGateway(t, ctx, bin, dbURL, redisURL, hook.server.URL, natsURL)
+	gw.awaitReady(t)
+	backfillStart := time.Now()
 
 	// Backfill: three READ events, one per pre-existing row.
 	events := awaitEvents(t, ctx, rdb, func(seen []payload) bool {
@@ -175,6 +189,23 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("backfill missing READ for id=%d; got %v", i, reads)
 		}
 	}
+
+	// Every pre-existing bulk row is backfilled exactly as READ.
+	bulkReads := awaitBulk(t, ctx, rdb, "READ", bulkRows)
+	t.Logf("backfilled %d rows in %s", bulkReads, time.Since(backfillStart).Round(time.Millisecond))
+
+	// Live volume: one transaction far larger than a batch (delivered in
+	// several batches before its commit is confirmed) plus many small
+	// transactions that the reader coalesces into shared batches.
+	liveStart := time.Now()
+	mustExec(t, ctx, db, fmt.Sprintf(
+		"INSERT INTO %s SELECT g, md5(g::text) FROM generate_series(%d, %d) g",
+		bulkTable, bulkRows+1, 2*bulkRows))
+	for i := 1; i <= 500; i++ {
+		mustExec(t, ctx, db, fmt.Sprintf("INSERT INTO %s VALUES ($1, 'small')", bulkTable), 2*bulkRows+i)
+	}
+	bulkInserts := awaitBulk(t, ctx, rdb, "INSERT", bulkRows+500)
+	t.Logf("streamed %d live rows in %s", bulkInserts, time.Since(liveStart).Round(time.Millisecond))
 
 	// Live stream: INSERT, UPDATE, DELETE on one row, in order.
 	mustExec(t, ctx, db, fmt.Sprintf(
@@ -281,7 +312,63 @@ func TestEndToEnd(t *testing.T) {
 		t.Errorf("stats disagree with the stream: %+v", stats)
 	}
 
+	// A second node on the same slot is a hot standby: it must not stream
+	// (or backfill) while the first holds the slot, and must take over when
+	// the first goes away.
+	standby := startGateway(t, ctx, bin, dbURL, redisURL, hook.server.URL, natsURL,
+		"CDC_SLOT_RETRY_INTERVAL=500ms")
+	time.Sleep(3 * time.Second)
+	if standby.ready() {
+		t.Fatal("a second node must not stream from a slot another node holds")
+	}
+
 	gw.stop(t)
+	standby.awaitReady(t)
+
+	mustExec(t, ctx, db, fmt.Sprintf(
+		"INSERT INTO %s (id, name) VALUES (7, 'after failover')", table))
+	awaitEvents(t, ctx, rdb, func(seen []payload) bool {
+		return rowEventCount(seen, "7") >= 1
+	})
+
+	standby.stop(t)
+}
+
+// awaitBulk waits until the bulk stream holds want distinct row ids for op,
+// and fails if any id is missing at that point. It returns the distinct count.
+func awaitBulk(t *testing.T, ctx context.Context, rdb *redis.Client, op string, want int) int {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		ids := make(map[string]struct{}, want)
+		start := "-"
+		for {
+			msgs, err := rdb.XRangeN(ctx, bulkStream, start, "+", 10000).Result()
+			if err != nil && err != redis.Nil {
+				t.Fatalf("xrange %s: %v", bulkStream, err)
+			}
+			for _, msg := range msgs {
+				var p payload
+				if err := json.Unmarshal([]byte(msg.Values["payload"].(string)), &p); err != nil {
+					t.Fatalf("bad payload JSON: %v", err)
+				}
+				if p.Operation == op {
+					ids[eventRowID(p)] = struct{}{}
+				}
+			}
+			if len(msgs) < 10000 {
+				break
+			}
+			start = "(" + msgs[len(msgs)-1].ID
+		}
+		if len(ids) >= want {
+			return len(ids)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bulk stream has %d distinct %s rows, want %d", len(ids), op, want)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // gateway is the compiled binary under test, running as a subprocess.
@@ -333,6 +420,7 @@ func startGateway(
 	t *testing.T,
 	ctx context.Context,
 	bin, dbURL, redisURL, webhookURL, natsURL string,
+	extraEnv ...string,
 ) *gateway {
 	t.Helper()
 
@@ -368,7 +456,10 @@ func startGateway(
 		"NATS_SUBJECT_PREFIX="+prefix,
 		"NATS_STREAM="+natsStream,
 		"LOG_LEVEL=DEBUG",
+		// The bulk run must not be trimmed out of the stream.
+		"REDIS_MAX_STREAM_LEN=200000",
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start gateway: %v", err)
 	}
@@ -382,20 +473,28 @@ func startGateway(
 		gw.dumpLogsOnFailure(t)
 	})
 
-	// Readiness flips true once replication is streaming.
+	return gw
+}
+
+// ready reports whether the gateway is streaming from the slot.
+func (g *gateway) ready() bool {
+	resp, err := http.Get(g.baseURL + "/readiness")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// awaitReady waits until replication is streaming.
+func (g *gateway) awaitReady(t *testing.T) {
+	t.Helper()
 	deadline := time.Now().Add(90 * time.Second)
-	for {
+	for !g.ready() {
 		if time.Now().After(deadline) {
 			t.Fatal("gateway never became ready")
 		}
-		resp, err := http.Get(gw.baseURL + "/readiness")
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return gw
-			}
-		}
-		if cmd.ProcessState != nil {
+		if g.cmd.ProcessState != nil {
 			t.Fatal("gateway exited before becoming ready")
 		}
 		time.Sleep(250 * time.Millisecond)

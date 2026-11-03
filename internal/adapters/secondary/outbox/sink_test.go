@@ -123,7 +123,7 @@ func TestProcessIgnoresOtherTablesAndOperations(t *testing.T) {
 	// Different table: silently skipped (fast path, no redis call).
 	ev := outboxEvent(map[string]any{"id": "e1"})
 	ev.Table = "users"
-	if err := sink.Process(context.Background(), ev); err != nil {
+	if err := sink.Process(context.Background(), []domain.CDCEvent{ev}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -135,7 +135,7 @@ func TestProcessIgnoresOtherTablesAndOperations(t *testing.T) {
 	} {
 		ev := outboxEvent(map[string]any{"id": "e1"})
 		ev.Operation = op
-		if err := sink.Process(context.Background(), ev); err != nil {
+		if err := sink.Process(context.Background(), []domain.CDCEvent{ev}); err != nil {
 			t.Fatalf("op %s must be skipped, got %v", op, err)
 		}
 	}
@@ -145,7 +145,7 @@ func TestExcludeTableWrapper(t *testing.T) {
 	inner := &captureSink{}
 	wrapped := ExcludeTable(inner, "public", "outbox")
 
-	if err := wrapped.Process(context.Background(), outboxEvent(map[string]any{"id": 1})); err != nil {
+	if err := wrapped.Process(context.Background(), []domain.CDCEvent{outboxEvent(map[string]any{"id": 1})}); err != nil {
 		t.Fatal(err)
 	}
 	if len(inner.events) != 0 {
@@ -154,7 +154,7 @@ func TestExcludeTableWrapper(t *testing.T) {
 
 	other := outboxEvent(map[string]any{"id": 1})
 	other.Table = "users"
-	if err := wrapped.Process(context.Background(), other); err != nil {
+	if err := wrapped.Process(context.Background(), []domain.CDCEvent{other}); err != nil {
 		t.Fatal(err)
 	}
 	if len(inner.events) != 1 {
@@ -173,7 +173,7 @@ func (s *captureSink) Name() string                      { return "capture" }
 func (s *captureSink) Initialize(context.Context) error  { return nil }
 func (s *captureSink) Shutdown(context.Context) error    { return nil }
 func (s *captureSink) HealthCheck(context.Context) error { return nil }
-func (s *captureSink) Process(_ context.Context, e domain.CDCEvent) error {
-	s.events = append(s.events, e)
+func (s *captureSink) Process(_ context.Context, events []domain.CDCEvent) error {
+	s.events = append(s.events, events...)
 	return nil
 }

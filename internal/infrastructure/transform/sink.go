@@ -73,28 +73,44 @@ func (s *Sink) Shutdown(ctx context.Context) error   { return s.inner.Shutdown(c
 func (s *Sink) HealthCheck(ctx context.Context) error {
 	return s.inner.HealthCheck(ctx)
 }
+func (s *Sink) MaxBatchEvents() int { return domain.MaxBatchEvents(s.inner) }
 
-func (s *Sink) Process(ctx context.Context, event domain.CDCEvent) error {
-	event, keep, err := s.global.Apply(event)
-	if err != nil {
-		return err
+func (s *Sink) Wants(schema, table string, op domain.Operation) bool {
+	if s.global.RejectsAll(schema, table, op) {
+		return false
 	}
-	if keep {
-		event, keep, err = s.tableChain(event).Apply(event)
+	probe := domain.CDCEvent{Schema: schema, Table: table}
+	if s.tableChain(probe).RejectsAll(schema, table, op) {
+		return false
+	}
+	return domain.Wants(s.inner, schema, table, op)
+}
+
+// Process transforms each event of the batch, drops the filtered ones, and
+// hands the rest to the inner sink as one batch.
+func (s *Sink) Process(ctx context.Context, events []domain.CDCEvent) error {
+	out := make([]domain.CDCEvent, 0, len(events))
+	for _, event := range events {
+		event, keep, err := s.global.Apply(event)
 		if err != nil {
-			return err
+			return domain.Permanent(err)
 		}
+		if keep {
+			event, keep, err = s.tableChain(event).Apply(event)
+			if err != nil {
+				return domain.Permanent(err)
+			}
+		}
+		if !keep {
+			metrics.EventsFiltered.WithLabelValues(s.inner.Name(), event.Schema, event.Table).Inc()
+			continue
+		}
+		out = append(out, event)
 	}
-	if !keep {
-		metrics.EventsFiltered.WithLabelValues(s.inner.Name(), event.Schema, event.Table).Inc()
-		s.logger.Debug("event filtered out",
-			slog.String("table", event.FullTableName()),
-			slog.String("event_id", event.ID),
-		)
+	if len(out) == 0 {
 		return nil
 	}
-
-	return s.inner.Process(ctx, event)
+	return s.inner.Process(ctx, out)
 }
 
 func (s *Sink) tableChain(event domain.CDCEvent) *Chain {

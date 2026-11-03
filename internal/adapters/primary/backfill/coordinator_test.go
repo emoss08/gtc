@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,10 @@ type fakeDB struct {
 	watermarks chan watermarkPayload
 	saved      chan TableState
 	loaded     map[string]TableState // returned by LoadState; nil means empty
+	persisted  map[string]TableState // returned by LoadTableState
+
+	mu      sync.Mutex
+	cursors [][]string // cursor passed to each SelectChunk
 }
 
 func newFakeDB(pk []string, chunks [][]Row) *fakeDB {
@@ -45,8 +50,11 @@ func (f *fakeDB) PrimaryKey(context.Context, string, string) ([]string, error) {
 }
 
 func (f *fakeDB) SelectChunk(
-	_ context.Context, _, _ string, _, _ []string, _ int,
+	_ context.Context, _, _ string, _, cursor []string, _ int,
 ) (*Chunk, error) {
+	f.mu.Lock()
+	f.cursors = append(f.cursors, cursor)
+	f.mu.Unlock()
 	idx := f.selects
 	f.selects++
 	if idx >= len(f.chunks) {
@@ -71,12 +79,16 @@ func (f *fakeDB) LoadState(context.Context) (map[string]TableState, error) {
 	}
 	return map[string]TableState{}, nil
 }
+func (f *fakeDB) LoadTableState(_ context.Context, table string) (TableState, bool, error) {
+	ts, ok := f.persisted[table]
+	return ts, ok, nil
+}
 func (f *fakeDB) SaveState(_ context.Context, _ string, state TableState) error {
 	f.saved <- state
 	return nil
 }
-func (f *fakeDB) ClearState(context.Context, string) error { return nil }
-func (f *fakeDB) Close()                                   {}
+func (f *fakeDB) MarkPending(context.Context, []string) error { return nil }
+func (f *fakeDB) Close()                                      {}
 
 func row(id int, name string) Row {
 	return Row{
@@ -131,6 +143,7 @@ func TestBackfillDropsRowsSupersededByStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c.Start(ctx)
+	c.OnStreamStart()
 
 	if err := c.EnqueueTable("public", "users"); err != nil {
 		t.Fatal(err)
@@ -174,16 +187,13 @@ func TestBackfillDropsRowsSupersededByStream(t *testing.T) {
 	}
 	c.WatermarkDelivered(marshal(t, high))
 
-	// Chunk 2 is empty: table completes.
-	low2 := waitWatermark(t, db, "low")
-	c.HandleWatermark("0/30", marshal(t, low2))
-	high2 := waitWatermark(t, db, "high")
-	if evs := c.HandleWatermark("0/40", marshal(t, high2)); len(evs) != 0 {
-		t.Fatalf("empty chunk must emit no events, got %d", len(evs))
-	}
-	c.WatermarkDelivered(marshal(t, high2))
-
+	// Three rows is less than the chunk size: the table is complete
+	// without another round trip.
 	waitForState(t, c, domain.BackfillDone)
+	assertNoWatermark(t, db)
+	if got := rowsCopied(c); got != 2 {
+		t.Errorf("rows copied = %d, want 2 (the superseded row is not counted)", got)
+	}
 }
 
 func TestBackfillRetriesChunkOnStreamRestart(t *testing.T) {
@@ -196,6 +206,7 @@ func TestBackfillRetriesChunkOnStreamRestart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c.Start(ctx)
+	c.OnStreamStart()
 
 	if err := c.EnqueueTable("public", "users"); err != nil {
 		t.Fatal(err)
@@ -204,7 +215,11 @@ func TestBackfillRetriesChunkOnStreamRestart(t *testing.T) {
 	// First attempt: watermarks are emitted, then the stream dies.
 	firstLow := waitWatermark(t, db, "low")
 	waitWatermark(t, db, "high")
-	c.OnStreamRestart()
+	c.OnStreamStop()
+
+	// Nothing is retried until the stream is back.
+	assertNoWatermark(t, db)
+	c.OnStreamStart()
 
 	// Retry emits fresh watermarks with a new chunk ID.
 	low := waitWatermark(t, db, "low")
@@ -225,14 +240,167 @@ func TestBackfillRetriesChunkOnStreamRestart(t *testing.T) {
 	}
 	c.WatermarkDelivered(marshal(t, high))
 
-	// Drain the final empty chunk.
-	low2 := waitWatermark(t, db, "low")
-	c.HandleWatermark("0/30", marshal(t, low2))
-	high2 := waitWatermark(t, db, "high")
-	c.HandleWatermark("0/40", marshal(t, high2))
-	c.WatermarkDelivered(marshal(t, high2))
+	waitForState(t, c, domain.BackfillDone)
+}
+
+func TestBackfillContinuesAfterFullChunk(t *testing.T) {
+	db := newFakeDB([]string{"id"}, [][]Row{
+		{row(1, "ada"), row(2, "bob")}, // == ChunkSize: more may follow
+		{row(3, "cy")},
+	})
+	c := NewCoordinator(db, Config{SlotName: "slot1", ChunkSize: 2}, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	c.OnStreamStart()
+	if err := c.EnqueueTable("public", "users"); err != nil {
+		t.Fatal(err)
+	}
+
+	playChunk(t, c, db, 2)
+	if status := statusOf(t, c); status.State != domain.BackfillRunning {
+		t.Fatalf("a full chunk must not complete the table, state = %s", status.State)
+	}
+	playChunk(t, c, db, 1)
 
 	waitForState(t, c, domain.BackfillDone)
+	if got := rowsCopied(c); got != 3 {
+		t.Errorf("rows copied = %d, want 3", got)
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if len(db.cursors) != 2 || len(db.cursors[1]) != 1 || db.cursors[1][0] != "2" {
+		t.Errorf("second chunk must start after the first chunk's last key, cursors = %v", db.cursors)
+	}
+}
+
+func TestBackfillWaitsForTheStream(t *testing.T) {
+	db := newFakeDB([]string{"id"}, [][]Row{{row(1, "ada")}})
+	c := NewCoordinator(db, Config{SlotName: "slot1", ChunkSize: 10}, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	if err := c.EnqueueTable("public", "users"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A standby node does not own the stream: its watermarks would never
+	// come back to it, so it must not emit any.
+	assertNoWatermark(t, db)
+
+	c.OnStreamStart()
+	playChunk(t, c, db, 1)
+	waitForState(t, c, domain.BackfillDone)
+}
+
+func TestBackfillSkipsTableCompletedByAnotherNode(t *testing.T) {
+	db := newFakeDB([]string{"id"}, [][]Row{{row(1, "ada")}})
+	finished := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	db.persisted = map[string]TableState{
+		"public.users": {Done: true, RowsCopied: 42, UpdatedAt: finished},
+	}
+	db.loaded = map[string]TableState{"public.users": {Cursor: []string{"7"}, RowsCopied: 7}}
+	c := NewCoordinator(db, Config{SlotName: "slot1", ChunkSize: 10}, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx) // queues the table as interrupted, from the stale snapshot
+	c.OnStreamStart()
+
+	waitForState(t, c, domain.BackfillDone)
+	assertNoWatermark(t, db)
+	status := statusOf(t, c)
+	if status.RowsCopied != 42 || status.CompletedAt == nil || !status.CompletedAt.Equal(finished) {
+		t.Errorf("status must reflect the persisted completion, got %+v", status)
+	}
+}
+
+func TestBackfillResumesFromPersistedCursor(t *testing.T) {
+	db := newFakeDB([]string{"id"}, [][]Row{{row(9, "zed")}})
+	db.loaded = map[string]TableState{"public.users": {Cursor: []string{"3"}, RowsCopied: 3}}
+	// Another node got further than this process's snapshot.
+	db.persisted = map[string]TableState{"public.users": {Cursor: []string{"8"}, RowsCopied: 8}}
+	c := NewCoordinator(db, Config{SlotName: "slot1", ChunkSize: 10}, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	c.OnStreamStart()
+
+	playChunk(t, c, db, 1)
+	waitForState(t, c, domain.BackfillDone)
+
+	db.mu.Lock()
+	cursors := db.cursors
+	db.mu.Unlock()
+	if len(cursors) != 1 || len(cursors[0]) != 1 || cursors[0][0] != "8" {
+		t.Errorf("must resume from the persisted cursor, selects used %v", cursors)
+	}
+	if got := rowsCopied(c); got != 9 {
+		t.Errorf("rows copied = %d, want 9 (8 before + 1)", got)
+	}
+}
+
+func TestChunkIDsAreUniqueAcrossInstances(t *testing.T) {
+	ids := make([]string, 2)
+	for i := range ids {
+		db := newFakeDB([]string{"id"}, [][]Row{{row(1, "ada")}})
+		c := NewCoordinator(db, Config{SlotName: "shared", ChunkSize: 10}, slog.Default())
+		ctx, cancel := context.WithCancel(context.Background())
+		c.Start(ctx)
+		c.OnStreamStart()
+		if err := c.EnqueueTable("public", "users"); err != nil {
+			t.Fatal(err)
+		}
+		ids[i] = waitWatermark(t, db, "low").Chunk
+		cancel()
+	}
+	if ids[0] == ids[1] {
+		t.Fatalf("two processes sharing a slot produced the same chunk id %q", ids[0])
+	}
+}
+
+// playChunk plays the stream's part for one chunk of want rows.
+func playChunk(t *testing.T, c *Coordinator, db *fakeDB, want int) {
+	t.Helper()
+	low := waitWatermark(t, db, "low")
+	c.HandleWatermark("0/10", marshal(t, low))
+	high := waitWatermark(t, db, "high")
+	if events := c.HandleWatermark("0/20", marshal(t, high)); len(events) != want {
+		t.Fatalf("chunk emitted %d events, want %d", len(events), want)
+	}
+	c.WatermarkDelivered(marshal(t, high))
+}
+
+func assertNoWatermark(t *testing.T, db *fakeDB) {
+	t.Helper()
+	select {
+	case p := <-db.watermarks:
+		t.Fatalf("unexpected %s watermark for chunk %s", p.Mark, p.Chunk)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func statusOf(t *testing.T, c *Coordinator) domain.BackfillTableStatus {
+	t.Helper()
+	for _, s := range c.Status() {
+		if s.Schema == "public" && s.Table == "users" {
+			return s
+		}
+	}
+	t.Fatalf("no status for public.users: %+v", c.Status())
+	return domain.BackfillTableStatus{}
+}
+
+func rowsCopied(c *Coordinator) int64 {
+	for _, s := range c.Status() {
+		if s.Table == "users" {
+			return s.RowsCopied
+		}
+	}
+	return -1
 }
 
 func TestForeignSlotWatermarksAreIgnored(t *testing.T) {

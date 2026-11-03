@@ -35,26 +35,56 @@ image goes to ghcr.io).
 
 GTC provides **at-least-once** delivery. The WAL position is only confirmed to
 PostgreSQL at transaction commit boundaries, after every sink has successfully
-processed every event in the transaction. If any sink fails, the replication
+processed every event up to that commit. If any sink fails, the replication
 connection is torn down and the unconfirmed events are redelivered on
 reconnect — so **sinks must tolerate duplicate events** (the built-in sinks are
 idempotent; stream consumers should dedupe by `event_id`).
 
+Events reach sinks in **batches**: the reader closes a batch at
+`CDC_BATCH_MAX_EVENTS`, after `CDC_BATCH_LINGER` since its first event, or
+before a backfill watermark. A batch may span transactions and may hold part
+of a large one; positions are confirmed only after the batch holding every
+event before them was handled. `Sink.Process` receives `[]CDCEvent` in stream
+order and must apply them in order (one row can appear several times in a
+batch). Sinks pay one round trip per batch, not per row: Meilisearch collapses
+consecutive same-kind events per index into one task and awaits all tasks with
+one poll; the Redis sinks pipeline; JetStream publishes asynchronously in
+windows. A sink whose unit is one event (webhook) implements
+`domain.BatchLimiter`, and the pipeline splits batches to that size before the
+DLQ and retry layers see them.
+
+Errors caused by the data (unrenderable key, a document the destination
+rejects) are wrapped with `domain.Permanent`: they are not retried and do not
+trip the circuit breaker.
+
 Consequences to keep in mind:
 
 - A sink that is down does not lose events; it stalls the pipeline (replication
-  slot WAL retention grows) until the sink recovers. A *poison event* (same
-  event failing the same sink CDC_DLQ_THRESHOLD times) is parked in the Redis
-  dead-letter queue instead, and triaged via GET /dlq, POST /dlq/retry,
-  POST /dlq/discard. Circuit-open failures never park (a down sink is not a
-  poison event), and a full/unreachable DLQ stalls rather than drops. Sink
-  layering is transform(dlq(resilience(sink))): parked entries hold the
-  already-transformed event, and retries bypass transforms so masking is
-  never re-applied.
-- `CDC_PROCESS_TIMEOUT` (default 10s) must stay small enough that
-  sink-count × timeout is below PostgreSQL's `wal_sender_timeout` (default
-  60s), because sinks run synchronously with the WAL stream and standby
-  keepalives are not sent mid-event.
+  slot WAL retention grows) until the sink recovers. A *poison event* is
+  parked in the Redis dead-letter queue instead, and triaged via GET /dlq,
+  POST /dlq/retry, POST /dlq/discard. The DLQ layer isolates it by bisecting
+  the failing batch (halves in order; succeeding halves are delivered): at
+  once for a permanent error, after CDC_DLQ_THRESHOLD failure cycles of the
+  batch (counted against its first event, stable across replays) for a
+  transient one. Circuit-open failures and timeouts never park (a down or
+  slow sink is not a poison event), and a full/unreachable DLQ stalls rather
+  than drops. Sink layering is transform(dlq(resilience(sink))): parked
+  entries hold the already-transformed event, and retries bypass transforms
+  so masking is never re-applied.
+- `CDC_PROCESS_TIMEOUT` (default 30s) bounds one delivery attempt of one batch
+  to one sink. The reader keeps sending standby keepalives from a side
+  goroutine while sinks work, so it is independent of `wal_sender_timeout`;
+  only `CDC_STANDBY_TIMEOUT` must stay well inside it (`gtc doctor` checks).
+  A Meilisearch attempt that times out leaves its tasks running: the sink
+  remembers them and a retry of the same batch resumes waiting instead of
+  enqueueing it again.
+- Several nodes may share one slot: PostgreSQL lets one stream at a time, the
+  others retry every `CDC_SLOT_RETRY_INTERVAL` and take over when it is free
+  (hot standby). The backfill worker runs only while its node streams,
+  chunk ids carry a per-process instance id, and a node re-reads a table's
+  persisted state before running it, so a takeover resumes another node's
+  progress. Tables are persisted as pending before they are queued, so a
+  restart mid-backfill resumes every queued table.
 - Unchanged TOAST columns are omitted from `NewData` (never sent as
   placeholder strings) and listed in `UnchangedToastColumns`. Sinks handle
   this with partial updates (Meilisearch `UpdateDocuments`, RedisJSON
@@ -84,18 +114,20 @@ Consequences to keep in mind:
 | CDC_AUTO_CREATE_SLOT | true | Create the replication slot if missing |
 | CDC_AUTO_CREATE_PUBLICATION | true | Create the publication (FOR ALL TABLES) if missing |
 | CDC_STANDBY_TIMEOUT | 10s | Standby message interval |
-| CDC_PARALLEL_SINKS | false | Process sinks in parallel |
-| CDC_PROCESS_TIMEOUT | 10s | Per-sink, per-event processing timeout |
+| CDC_PARALLEL_SINKS | true | Deliver each batch to all sinks concurrently |
+| CDC_PROCESS_TIMEOUT | 30s | Timeout of one delivery attempt of one batch to one sink |
+| CDC_BATCH_MAX_EVENTS | 5000 | Most events handed to the sinks at once |
+| CDC_BATCH_LINGER | 10ms | Longest an event waits for its batch to fill when the stream is quiet |
 | CDC_EXCLUDED_TABLES | - | Comma-separated tables to exclude (e.g., public.migrations,audit_logs) |
 | CDC_SLOT_RETRY_INTERVAL | 5s | Wait between retries when the slot is busy |
 | CDC_SLOT_RETRY_TIMEOUT | 60s | Give up starting replication after this long |
-| CDC_MAX_RETRIES | 3 | Per-sink retry attempts before failing the event |
+| CDC_MAX_RETRIES | 3 | Per-sink retry attempts before failing the batch |
 | CDC_RETRY_BACKOFF_INITIAL | 100ms | Initial retry backoff |
 | CDC_RETRY_BACKOFF_MAX | 10s | Maximum retry backoff |
 | CDC_CIRCUIT_BREAKER_THRESHOLD | 5 | Consecutive failures before the circuit opens |
 | CDC_CIRCUIT_BREAKER_TIMEOUT | 30s | How long an open circuit stays open |
 | CDC_BACKFILL_MODE | auto | auto = backfill all tables when the slot is first created; manual = API only; off |
-| CDC_BACKFILL_CHUNK_SIZE | 1000 | Rows per backfill chunk |
+| CDC_BACKFILL_CHUNK_SIZE | 5000 | Rows per backfill chunk (a shorter chunk ends the table) |
 | CDC_BACKFILL_CHUNK_DELAY | 0 | Pause between chunks |
 | CDC_BACKFILL_STATE_TABLE | gtc_backfill_state | Progress table in the source DB ("none" disables resume) |
 | CDC_DLQ_ENABLED | true | Park poison events in Redis instead of stalling forever (needs REDIS_URL) |

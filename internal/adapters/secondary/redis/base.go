@@ -76,6 +76,10 @@ func (s *BaseSink) HealthCheck(ctx context.Context) error {
 	return s.Client.Ping(ctx).Err()
 }
 
+func (s *BaseSink) Wants(schema, table string, _ domain.Operation) bool {
+	return s.Config.KeyResolver.ShouldProcess(schema, table)
+}
+
 func (s *BaseSink) ShouldProcess(event domain.CDCEvent) bool {
 	return s.Config.KeyResolver.ShouldProcess(event.Schema, event.Table)
 }

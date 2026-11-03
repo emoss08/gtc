@@ -23,6 +23,12 @@ RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
 
+# GTC allocates a short-lived map per row; at the default GOGC=100 garbage
+# collection takes ~40% of its CPU under backfill load. Doubling the headroom
+# halves collection work for a bounded heap (batches are a few MB). Override
+# per deployment, and set GOMEMLIMIT under a container memory limit.
+ENV GOGC=200
+
 COPY --from=builder /gateway /app/gateway
 COPY --from=builder /app/config /app/config
 

@@ -22,9 +22,14 @@ type BackfillController interface {
 	// WatermarkDelivered is called after every event returned by
 	// HandleWatermark was successfully processed by all sinks.
 	WatermarkDelivered(content []byte)
-	// OnStreamRestart is called when the replication stream is torn down;
-	// any in-flight chunk must be retried with fresh watermarks.
-	OnStreamRestart()
+	// OnStreamStart is called when this process starts consuming the
+	// replication stream. Backfill chunks only run while it does: another
+	// node may own the slot, and watermarks only come back to the node that
+	// streams them.
+	OnStreamStart()
+	// OnStreamStop is called when the replication stream is torn down; any
+	// in-flight chunk is retried with fresh watermarks once it is back.
+	OnStreamStop()
 }
 
 // BackfillManager is the operational surface for triggering and inspecting
