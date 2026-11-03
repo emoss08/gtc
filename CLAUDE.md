@@ -85,6 +85,14 @@ Consequences to keep in mind:
   persisted state before running it, so a takeover resumes another node's
   progress. Tables are persisted as pending before they are queued, so a
   restart mid-backfill resumes every queued table.
+- Backfill reads only tables some sink wants as `READ` events
+  (`domain.Router`; `transform.Chain.RejectsAll` evaluates CEL filters with
+  the row unknown). It runs `CDC_BACKFILL_CONCURRENCY` tables at once with two
+  chunks in flight per table, and decoding runs ahead of delivery through an
+  ordered queue in the reader; positions are confirmed by the delivery
+  goroutine only. Anything a consumer holds past the next message (e.g. a
+  watermark's content) must be copied: pgoutput slices alias pgconn's receive
+  buffer.
 - Unchanged TOAST columns are omitted from `NewData` (never sent as
   placeholder strings) and listed in `UnchangedToastColumns`. Sinks handle
   this with partial updates (Meilisearch `UpdateDocuments`, RedisJSON
@@ -129,12 +137,14 @@ Consequences to keep in mind:
 | CDC_BACKFILL_MODE | auto | auto = backfill all tables when the slot is first created; manual = API only; off |
 | CDC_BACKFILL_CHUNK_SIZE | 5000 | Rows per backfill chunk (a shorter chunk ends the table) |
 | CDC_BACKFILL_CHUNK_DELAY | 0 | Pause between chunks |
+| CDC_BACKFILL_CONCURRENCY | 4 | Tables backfilled at once (two chunks in flight each) |
 | CDC_BACKFILL_STATE_TABLE | gtc_backfill_state | Progress table in the source DB ("none" disables resume) |
 | CDC_DLQ_ENABLED | true | Park poison events in Redis instead of stalling forever (needs REDIS_URL) |
 | CDC_DLQ_THRESHOLD | 3 | Failure cycles for the same event before it is parked |
 | CDC_DLQ_MAX_ENTRIES | 10000 | DLQ cap; when full, parking fails and the pipeline stalls |
 | CDC_MASK_HMAC_KEY | - | Secret key for the hmac256 mask strategy (startup fails if a transform uses hmac256 without it) |
 | CDC_SCHEMA_EVENTS | true | Publish detected DDL changes to the <prefix>:schema Redis stream (detection/metrics/API always on) |
+| CDC_PPROF_ENABLED | false | Serve Go's profiler under /debug/pprof on the HTTP port |
 | SINK_CONFIG_FILE | - | Path to per-table sink YAML (see config/sinks.example.yaml). Without it, key-templated sinks mirror all tables |
 | REDIS_URL | - | Redis connection (enables stream sink if set) |
 | REDIS_STREAM_PREFIX | cdc | Stream key prefix |
