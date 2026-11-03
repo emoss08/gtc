@@ -108,7 +108,7 @@ func (s *Sink) Initialize(ctx context.Context) error {
 // Process publishes the batch's outbox rows in one pipelined round trip and,
 // with delete-after-publish, removes them with one statement.
 func (s *Sink) Process(ctx context.Context, events []domain.CDCEvent) error {
-	pipe := s.client.Pipeline()
+	var pipe redis.Pipeliner // created on the first outbox row
 	var published []any
 
 	for i := range events {
@@ -124,6 +124,9 @@ func (s *Sink) Process(ctx context.Context, events []domain.CDCEvent) error {
 		if err != nil {
 			return domain.Permanent(err)
 		}
+		if pipe == nil {
+			pipe = s.client.Pipeline()
+		}
 		pipe.XAdd(ctx, &redis.XAddArgs{
 			Stream: streamKey,
 			MaxLen: s.cfg.MaxStreamLen,
@@ -138,10 +141,10 @@ func (s *Sink) Process(ctx context.Context, events []domain.CDCEvent) error {
 		}
 	}
 
-	queued := pipe.Len()
-	if queued == 0 {
+	if pipe == nil {
 		return nil
 	}
+	queued := pipe.Len()
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("outbox: publish %d messages: %w", queued, err)
 	}

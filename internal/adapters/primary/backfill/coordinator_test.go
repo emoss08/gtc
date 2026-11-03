@@ -492,12 +492,15 @@ func TestReplayAllRequeuesCompletedTables(t *testing.T) {
 }
 
 func TestBackfillPersistsRowsCopied(t *testing.T) {
+	// A full chunk (rows == ChunkSize) is followed by another, so its
+	// progress is saved with a cursor before the table completes.
 	db := newFakeDB([]string{"id"}, [][]Row{{row(1, "ada"), row(2, "bob")}})
-	c := NewCoordinator(db, Config{SlotName: "slot1", ChunkSize: 10}, slog.Default())
+	c := NewCoordinator(db, Config{SlotName: "slot1", ChunkSize: 2}, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c.Start(ctx)
+	c.OnStreamStart()
 	if err := c.EnqueueTable("public", "users"); err != nil {
 		t.Fatal(err)
 	}

@@ -247,11 +247,13 @@ func TestEndToEnd(t *testing.T) {
 	}
 
 	// The webhook sink delivered the same live changes over HTTP.
+	// The webhook receives every table (the bulk table has a row 4 too), so
+	// only this table's events count.
 	hookEvents := hook.await(t, func(got []payload) bool {
-		return rowEventCount(got, "4") >= 3
+		return rowEventCount(ofTable(got, table), "4") >= 3
 	})
 	var hookOps []string
-	for _, e := range hookEvents {
+	for _, e := range ofTable(hookEvents, table) {
 		if eventRowID(e) == "4" && (len(hookOps) == 0 || hookOps[len(hookOps)-1] != e.Operation) {
 			hookOps = append(hookOps, e.Operation)
 		}
@@ -686,6 +688,16 @@ func distinctIDs(events []payload, op string) map[string]struct{} {
 		}
 	}
 	return ids
+}
+
+func ofTable(events []payload, name string) []payload {
+	var out []payload
+	for _, e := range events {
+		if e.Table == name {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func rowEventCount(events []payload, id string) int {
