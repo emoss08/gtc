@@ -1,17 +1,23 @@
-# GTC — Go Change Data Capture for PostgreSQL
+# GTC — PostgreSQL Change Data Capture (CDC) in a Single Go Binary
 
 [![CI](https://github.com/emoss08/gtc/actions/workflows/ci.yml/badge.svg)](https://github.com/emoss08/gtc/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/emoss08/gtc?sort=semver)](https://github.com/emoss08/gtc/releases)
 [![Go Version](https://img.shields.io/badge/go-1.25-00ADD8?logo=go)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-GTC streams row-level changes straight from the PostgreSQL WAL to Redis
-Streams, RedisJSON, and Meilisearch — as **a single Go binary with no Kafka,
-no ZooKeeper, and no Connect cluster**.
+GTC is an open-source **PostgreSQL change data capture (CDC)** tool. It reads
+row-level changes (`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`) straight from the
+PostgreSQL write-ahead log over logical replication and streams them to
+**Redis Streams, RedisJSON, Meilisearch, NATS JetStream, and webhooks** — as
+**a single Go binary with no Kafka, no ZooKeeper, and no Connect cluster**.
 
 It exists for the very common case where Debezium is the right idea but the
-wrong amount of infrastructure: you want your caches and search indexes to
-follow your database in near-real-time, and you don't want to operate a
-streaming platform to get there.
+wrong amount of infrastructure: you want your caches, search indexes, and
+downstream services to follow your database in near-real-time, and you don't
+want to operate a streaming platform to get there. On a 4-vCPU machine it
+delivers **[~140,000 events/s](#performance)** to Redis Streams with
+at-least-once delivery, and commit-to-consumer latency is a few
+milliseconds.
 
 ```
 PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (event bus)
@@ -20,6 +26,29 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
                                        ├──▶ NATS JetStream  (durable pub/sub)
                                        └──▶ Webhooks        (any HTTP endpoint)
 ```
+
+**Contents:** [Use cases](#use-cases) · [Features](#features) ·
+[Performance](#performance) · [Quick start](#quick-start) ·
+[Event format](#event-format) · [Configuration](#configuration) ·
+[Webhook and NATS sinks](#webhook-and-nats-sinks) ·
+[Schema changes](#schema-changes-ddl) · [Backfill and replay](#backfill-and-replay) ·
+[Delivery semantics](#delivery-semantics) · [Observability](#observability) ·
+[Architecture](#architecture) · [When not to use GTC](#when-not-to-use-gtc)
+
+## Use cases
+
+- **Cache sync and invalidation** — keep Redis (streams or JSON documents)
+  in step with PostgreSQL without dual writes in application code.
+- **Search indexing** — mirror tables into Meilisearch, with partial
+  document updates and per-index settings, and re-sync on demand.
+- **Event-driven microservices** — publish every row change, or curated
+  domain events through the [transactional outbox](#transactional-outbox),
+  to Redis Streams or NATS JetStream.
+- **Webhooks and integrations** — push signed change notifications to any
+  HTTP endpoint (serverless functions, SaaS APIs, internal services).
+- **Lightweight Debezium alternative** — real-time PostgreSQL replication
+  into the tools you already run, with backfill, a dead-letter queue, PII
+  masking, and a dashboard included.
 
 ## Features
 
@@ -88,6 +117,58 @@ PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (eve
 
 ![GTC dashboard — pipeline overview](docs/dashboard.png)
 
+## Performance
+
+End-to-end numbers from the [benchmark harness](test/bench): real
+PostgreSQL in, real sinks out, counted from the gateway's own metrics only
+once **every sink has acknowledged every event**. Default settings
+throughout (5,000-event batches, 10 ms linger, retries, circuit breakers
+and the DLQ all on).
+
+| Scenario | Sinks | Events | Time | Throughput |
+|----------|-------|-------:|-----:|-----------:|
+| stream | none (decode + batch only) | 1,000,000 | 5.8 s | **172,700 events/s** |
+| stream | Redis Streams | 1,000,000 | 7.1 s | **141,300 events/s** |
+| stream | NATS JetStream | 1,000,000 | 10.4 s | **96,000 events/s** |
+| stream | Redis Streams + NATS JetStream | 1,000,000 | 12.0 s | **83,000 events/s** |
+| stream | Webhook (one signed POST per event) | 100,000 | 14.3 s | **7,000 events/s** |
+| backfill | Redis Streams | 1,000,000 | 6.4 s | **156,800 rows/s** |
+| backfill | NATS JetStream | 1,000,000 | 9.7 s | **103,600 rows/s** |
+
+Setup: one 4-vCPU Intel Xeon @ 2.30 GHz VM (15 GB RAM) running *everything*
+— PostgreSQL 16, Redis 7, an in-process NATS JetStream server, the webhook
+receiver, the load generator and GTC — so the sinks compete with GTC for the
+same four cores. Rows have seven columns (~200 bytes), written 1,000 per
+transaction. Median of three runs.
+
+- **stream** — 1M committed changes waiting in the slot; time from the first
+  delivered event until the last one is acknowledged by every sink. This is
+  how fast GTC catches up after downtime, and its ceiling for live traffic.
+- **backfill** — copy an existing 1M-row table to the sinks as `READ` events
+  with the lock-free watermark backfill.
+- **no sinks** — decoding and batching alone: the overhead GTC adds before
+  any sink does work.
+- **webhook** — one signed `POST` per event by design (each event is its own
+  retry/dead-letter unit), so it is bounded by the receiver's round trip.
+
+**Latency** at a steady 1,000 single-row transactions per second, measured
+from the client's `INSERT` to a consumer's `XREAD` on the Redis stream:
+**p50 6.8 ms · p90 11.1 ms · p99 12.0 ms** (p99.9 30.8 ms). Most of that is
+the 10 ms `CDC_BATCH_LINGER` that lets a quiet stream fill a batch; lower it
+if latency matters more than throughput.
+
+Reproduce it on your hardware:
+
+```bash
+go build -o gateway ./cmd/gateway
+go run ./test/bench -gateway ./gateway -redis redis://127.0.0.1:6379
+```
+
+RedisJSON and Meilisearch are not in the table yet: the harness supports
+both (`-redis-json`, `-meili`), but they were not available on the benchmark
+machine. See [`test/bench/README.md`](test/bench/README.md) for what each
+scenario does and the flags.
+
 ## Quick start
 
 ### Docker Compose
@@ -140,8 +221,18 @@ $env:REDIS_URL = "redis://localhost:6379"
 ```
 
 That's the whole setup: with no further configuration GTC mirrors every table
-in the publication to Redis. Add `REDIS_JSON_URL` and/or `MEILISEARCH_URL` to
-enable the other sinks. `gateway --version` prints the build version.
+in the publication to Redis. Every sink is switched on by its URL, and any
+combination can run at once:
+
+| Sink | Enable with | What you get |
+|------|-------------|--------------|
+| Redis Streams | `REDIS_URL` | One stream entry per change (`XADD`), fan-out to consumer groups |
+| RedisJSON | `REDIS_JSON_URL` | One JSON document per row, merged on update, deleted on delete |
+| Meilisearch | `MEILISEARCH_URL` | Search index per table (tables mapped in `SINK_CONFIG_FILE`) |
+| NATS JetStream | `NATS_URL` | Acknowledged, LSN-deduplicated publishes to `<prefix>.<schema>.<table>` |
+| Webhooks | `WEBHOOK_URL` | An HTTP `POST` per change, HMAC-signed with `WEBHOOK_SIGNING_SECRET` |
+
+`gateway --version` prints the build version.
 
 ### PostgreSQL requirements
 
@@ -171,8 +262,10 @@ It verifies everything in one pass — `wal_level`, replication privileges
 (including a real `IDENTIFY_SYSTEM` handshake), free replication slots and
 WAL senders, publication/slot existence vs. auto-create permissions, tables
 that would reject UPDATE/DELETE for lack of a replica identity, sink
-reachability (Redis `PING`, RedisJSON module presence, Meilisearch health),
-transform compilation, and whether your sink timeouts fit inside
+reachability (Redis `PING`, RedisJSON module presence, Meilisearch health,
+NATS JetStream availability, webhook URL and signing), sinks that would
+deliver nothing under your sink YAML, transform compilation, and whether
+your sink timeouts fit inside
 `wal_sender_timeout` — then exits 0 if GTC is ready to stream, 1 if
 something needs fixing, with a concrete hint per finding:
 
@@ -273,8 +366,12 @@ lives in an optional YAML file.
 
 ### Per-table sink routing
 
-Without `SINK_CONFIG_FILE`, both Redis sinks mirror **all** tables with
-default key patterns. To route selectively, provide a YAML file (see
+Without `SINK_CONFIG_FILE`, the key-templated sinks (Redis Streams,
+RedisJSON, NATS, webhooks) mirror **all** tables with default key patterns.
+Once a file is present, each of those sinks needs `sync_all: true` or an
+explicit `tables` map, or it delivers nothing (`gtc doctor` warns about
+this). Meilisearch only ever indexes the tables mapped under
+`meilisearch.tables`. To route selectively, provide a YAML file (see
 [`config/sinks.example.yaml`](config/sinks.example.yaml)):
 
 ```yaml
@@ -353,7 +450,8 @@ columns. Filtered events count in `cdc_events_filtered_total{sink,schema,table}`
 > RedisJSON key patterns should only reference **replica identity** columns
 > (normally the primary key). Other columns are absent from DELETE events,
 > so a key built from them would miss the document it is meant to delete.
-> The Meilisearch sink expects documents to have an `id` column.
+> Meilisearch documents are keyed by `primary_key` (default `id`), which
+> should likewise be a replica identity column.
 
 ### Transactional outbox
 
@@ -671,6 +769,7 @@ networks.
 |----------|---------|
 | `GET /` | Embedded dashboard |
 | `GET /api/stats` | Dashboard's JSON snapshot (uptime, lag, sinks, tables, backfill, DLQ) |
+| `GET /api/history` | Recent throughput and lag samples behind the dashboard charts |
 | `GET /api/schema` | Recently detected schema (DDL) changes, newest first |
 | `GET /health` | Liveness — process is up |
 | `GET /readiness` | Readiness — live replication stream **and** all sinks healthy |
@@ -688,6 +787,9 @@ Key metrics (all prefixed `cdc_`): `events_received_total`,
 errors), `retry_attempts_total`,
 `circuit_breaker_state` (0 closed / 1 half-open / 2 open), `wal_lag_bytes`,
 `last_processed_lsn`, `inflight_events`, `events_excluded_total`,
+`events_filtered_total{sink,schema,table}`, `backfill_rows_total`,
+`dlq_entries`, `dlq_parked_total`, `dlq_retried_total`,
+`schema_changes_total{schema,table,kind}`, `schema_publish_errors_total`,
 `active_sinks`.
 
 ## Architecture
@@ -708,14 +810,22 @@ internal/
       redis/           # Redis Stream sink + shared base/key templates
       redisjson/       # RedisJSON document sink
       meilisearch/     # Meilisearch indexing sink
+      nats/            # NATS / JetStream publisher
+      webhook/         # Signed HTTP webhook sink
       outbox/          # Transactional outbox publisher
   infrastructure/
     config/            # Env + sink YAML loading
+    transform/         # Per-sink CEL filters, masking, column dropping
     resilience/        # Retry + circuit breaker wrapper for sinks
     dlq/               # Dead-letter queue: parking decorator + triage API backend
-    server/            # HTTP health/readiness/metrics
+    doctor/            # `gtc doctor` preflight checks
+    schema/            # DDL change detection history + notification stream
+    server/            # HTTP API, health/readiness/metrics, embedded dashboard
     metrics/           # Prometheus collectors
 ui/                    # React dashboard (built dist/ is committed and embedded)
+test/
+  integration/         # End-to-end test against real PostgreSQL + Redis + NATS
+  bench/               # End-to-end throughput/latency benchmark harness
 ```
 
 The core never imports an adapter; sinks implement a five-method
