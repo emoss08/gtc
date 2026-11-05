@@ -19,6 +19,9 @@ delivers **[~140,000 events/s](#performance)** to Redis Streams with
 at-least-once delivery, and commit-to-consumer latency is a few
 milliseconds.
 
+**Used in production** by [Trenova](https://trenova.app), an AI-driven,
+asset-based transportation management system (TMS).
+
 ```
 PostgreSQL ──logical replication──▶ GTC ──▶ Redis Streams   (event bus)
                                        ├──▶ RedisJSON       (document mirror / cache)
