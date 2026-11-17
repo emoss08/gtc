@@ -90,7 +90,7 @@ func (s *StreamSink) Process(ctx context.Context, events []domain.CDCEvent) erro
 		return nil
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("append %d stream entries: %w", queued, err)
+		return fmt.Errorf("append %d stream entries: %w", queued, ClassifyError(err))
 	}
 	return nil
 }

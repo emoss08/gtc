@@ -97,7 +97,7 @@ func (s *JSONSink) Process(ctx context.Context, events []domain.CDCEvent) error 
 		return nil
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("write %d json commands: %w", queued, err)
+		return fmt.Errorf("write %d json commands: %w", queued, redis.ClassifyError(err))
 	}
 	return nil
 }

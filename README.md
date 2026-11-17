@@ -596,14 +596,33 @@ GTC is **at-least-once**:
 2. An LSN is confirmed to PostgreSQL only at a transaction boundary, and only
    after every sink processed every event up to it. Decoding runs a couple of
    batches ahead of delivery, but confirmation never does.
-3. If any sink fails (after retries and the circuit breaker), the replication
-   connection is torn down and PostgreSQL redelivers everything after the
-   last confirmed LSN on reconnect.
+3. If a sink is **unavailable** (see below), GTC holds the batch and keeps
+   retrying that sink with backoff (up to 30s apart) until it takes it; the
+   stream does not move on. If a sink fails for any other reason (after
+   retries and the circuit breaker), the replication connection is torn down
+   and PostgreSQL redelivers everything after the last confirmed LSN on
+   reconnect.
 
 Consequences worth knowing:
 
 - A down sink **stalls the pipeline** rather than losing data; WAL retention
-  on the slot grows until the sink recovers. Monitor `cdc_wal_lag_bytes`.
+  on the slot grows until the sink recovers. Monitor `cdc_wal_lag_bytes` and
+  `cdc_sink_stalled{sink}` (1 while GTC waits for that sink). While a sink is
+  stalled, `/readiness` is not ready and names it, GTC logs a warning when
+  the stall starts and once a minute while it lasts, and one line when the
+  sink is back.
+- A sink is unavailable when its failure is about the sink, not the change:
+  connection refused, reset or dropped, DNS or network timeouts, an attempt
+  that timed out, an open circuit breaker, a 5xx, 408, 429, 401 or 403 from
+  Meilisearch or a webhook (and 404 from a webhook), Redis loading,
+  read-only, out of memory, cluster down or refusing credentials, NATS
+  disconnected or not answering, or any other failure while the sink's own
+  health check fails too.
+- Every sink receives each batch, and the stream advances only when all of
+  them took it: one slot, one position. So a stalled sink holds the others
+  too (they keep what they already took and wait for the next batch). This
+  is what keeps the position correct: the slot can only be confirmed past a
+  change every sink has.
 - Sinks (and stream consumers) must tolerate duplicates. The built-in sinks
   are idempotent; consumers should dedupe by `event_id`.
 - Large in-progress transactions are not streamed before commit by design —
@@ -621,18 +640,21 @@ oversized value) — would otherwise stall the pipeline forever. With Redis
 configured, GTC parks it instead. A failing batch is split in half until the
 failure is pinned to single events: the halves that succeed are delivered,
 and only the events that fail on their own are stored in Redis, so one bad
-row costs a handful of extra sink calls, not the batch. Failures the sink
-reports as caused by the data (a document Meilisearch rejects, a key that
-cannot be rendered) are isolated at once; other failures first get
-`CDC_DLQ_THRESHOLD` (default 3) full retry-and-replay cycles.
+row costs a handful of extra sink calls, not the batch, and the changes after
+it keep flowing. Failures the sink reports as caused by the data (a document
+Meilisearch rejects with a 4xx, a key that cannot be rendered, a webhook
+400/413/422) are isolated at once; other failures from a sink that is up
+first get `CDC_DLQ_THRESHOLD` (default 3) full retry-and-replay cycles.
 
-The distinction that matters: **outages never divert to the DLQ.** A failure
-caused by an open circuit breaker or a timeout means the sink is down or
-slow, so it stalls the pipeline (as it should) instead of shoveling the whole
-stream into the queue.
-And when the DLQ is full (`CDC_DLQ_MAX_ENTRIES`, default 10000) or Redis is
+The rule that matters, for every sink: **a sink that is down stalls the
+pipeline and loses nothing; only a change the sink rejects is parked.** A
+failure that says the sink is unavailable (the list above) is never counted
+toward the threshold and never split or parked, however long the outage
+lasts — not even when it starts in the middle of isolating a batch. And when
+the DLQ is full (`CDC_DLQ_MAX_ENTRIES`, default 10000) or Redis is
 unreachable, parking fails and the pipeline stalls — the DLQ never drops an
-event to save itself.
+event to save itself. Since a down sink never parks anything, the queue only
+holds changes a sink rejected; nothing is retried automatically.
 
 Triage over HTTP:
 
@@ -673,7 +695,7 @@ networks.
 | `GET /api/stats` | Dashboard's JSON snapshot (uptime, lag, sinks, tables, backfill, DLQ) |
 | `GET /api/schema` | Recently detected schema (DDL) changes, newest first |
 | `GET /health` | Liveness — process is up |
-| `GET /readiness` | Readiness — live replication stream **and** all sinks healthy |
+| `GET /readiness` | Readiness — live replication stream, all sinks healthy **and** none stalled; when not ready, names `stalled_sinks` and `unhealthy_sinks` |
 | `GET /metrics` | Prometheus metrics |
 | `GET /backfill` | Backfill progress per table |
 | `POST /backfill` | Trigger a backfill/replay (`{"table":"schema.table"}` or `{"all":true}`) |

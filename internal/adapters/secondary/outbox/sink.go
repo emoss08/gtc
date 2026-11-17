@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/bytedance/sonic"
+	redissink "github.com/emoss08/gtc/internal/adapters/secondary/redis"
 	"github.com/emoss08/gtc/internal/core/domain"
 	"github.com/emoss08/gtc/internal/infrastructure/config"
 	"github.com/jackc/pgx/v5"
@@ -146,7 +147,7 @@ func (s *Sink) Process(ctx context.Context, events []domain.CDCEvent) error {
 	}
 	queued := pipe.Len()
 	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("outbox: publish %d messages: %w", queued, err)
+		return fmt.Errorf("outbox: publish %d messages: %w", queued, redissink.ClassifyError(err))
 	}
 
 	if s.cfg.DeleteAfterPublish && len(published) > 0 {

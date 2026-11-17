@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -95,4 +96,32 @@ func (s *BaseSink) GenerateKey(event domain.CDCEvent) (string, error) {
 		return "", fmt.Errorf("generate key: %w", err)
 	}
 	return key, nil
+}
+
+// ClassifyError marks the failures that mean the Redis server cannot take
+// writes right now (still loading, read-only replica, out of memory, cluster
+// or master down, refused credentials or permissions, closed or exhausted
+// pool) as domain.Unavailable, so the pipeline stalls on them instead of
+// parking events. Transport failures are recognized by domain.IsUnavailable
+// itself. Anything else is returned unchanged.
+func ClassifyError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, redis.ErrClosed),
+		errors.Is(err, redis.ErrPoolTimeout),
+		errors.Is(err, redis.ErrPoolExhausted),
+		redis.IsLoadingError(err),
+		redis.IsReadOnlyError(err),
+		redis.IsClusterDownError(err),
+		redis.IsTryAgainError(err),
+		redis.IsMasterDownError(err),
+		redis.IsMaxClientsError(err),
+		redis.IsAuthError(err),
+		redis.IsPermissionError(err),
+		redis.IsOOMError(err),
+		redis.IsNoReplicasError(err):
+		return domain.Unavailable(err)
+	}
+	return err
 }

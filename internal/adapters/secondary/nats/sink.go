@@ -214,14 +214,14 @@ func (s *Sink) Process(ctx context.Context, events []domain.CDCEvent) error {
 	if s.js == nil {
 		for _, msg := range msgs {
 			if err := s.conn.PublishMsg(msg); err != nil {
-				return fmt.Errorf("publish %s: %w", msg.Subject, err)
+				return fmt.Errorf("publish %s: %w", msg.Subject, classify(err))
 			}
 		}
 		// FlushWithContext refuses a context without a deadline.
 		flushCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
 		defer cancel()
 		if err := s.conn.FlushWithContext(flushCtx); err != nil {
-			return fmt.Errorf("flush %d messages: %w", len(msgs), err)
+			return fmt.Errorf("flush %d messages: %w", len(msgs), classify(err))
 		}
 		return nil
 	}
@@ -246,7 +246,7 @@ func (s *Sink) publishWindow(ctx context.Context, msgs []*nats.Msg, ids []string
 			jetstream.WithRetryAttempts(0),
 		)
 		if err != nil {
-			return fmt.Errorf("publish %s: %w", msg.Subject, err)
+			return fmt.Errorf("publish %s: %w", msg.Subject, classify(err))
 		}
 		futures[i] = f
 	}
@@ -255,7 +255,7 @@ func (s *Sink) publishWindow(ctx context.Context, msgs []*nats.Msg, ids []string
 		select {
 		case <-f.Ok():
 		case err := <-f.Err():
-			return fmt.Errorf("publish %s (event %s): %w", msgs[i].Subject, ids[i], err)
+			return fmt.Errorf("publish %s (event %s): %w", msgs[i].Subject, ids[i], classify(err))
 		case <-ctx.Done():
 			return fmt.Errorf("await publish acks: %w", ctx.Err())
 		}
@@ -313,4 +313,35 @@ func SanitizeSubject(subject string) string {
 		}
 		return r
 	}, subject)
+}
+
+// classify tells a NATS server that cannot take messages (connection closed,
+// reconnecting or refused, no server or stream answering, acks timing out,
+// a JetStream 5xx) from a message that cannot be published (too large, bad
+// subject). The first kind stalls the pipeline; the second is parked.
+func classify(err error) error {
+	var apiErr *jetstream.APIError
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, nats.ErrMaxPayload), errors.Is(err, nats.ErrBadSubject):
+		return domain.Permanent(err)
+	case errors.Is(err, nats.ErrConnectionClosed),
+		errors.Is(err, nats.ErrConnectionDraining),
+		errors.Is(err, nats.ErrConnectionReconnecting),
+		errors.Is(err, nats.ErrInvalidConnection),
+		errors.Is(err, nats.ErrStaleConnection),
+		errors.Is(err, nats.ErrNoServers),
+		errors.Is(err, nats.ErrNoResponders),
+		errors.Is(err, nats.ErrTimeout),
+		errors.Is(err, nats.ErrAuthorization),
+		errors.Is(err, jetstream.ErrNoStreamResponse),
+		errors.Is(err, jetstream.ErrTooManyStalledMsgs),
+		errors.Is(err, jetstream.ErrAsyncPublishTimeout),
+		errors.Is(err, jetstream.ErrJetStreamNotEnabled),
+		errors.Is(err, jetstream.ErrJetStreamPublisherClosed),
+		errors.As(err, &apiErr) && apiErr.Code >= 500:
+		return domain.Unavailable(err)
+	}
+	return err
 }

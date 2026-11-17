@@ -61,6 +61,24 @@ var (
 		[]string{"sink"},
 	)
 
+	SinkStalled = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "cdc",
+			Name:      "sink_stalled",
+			Help:      "1 while the pipeline holds its position waiting for an unavailable sink, else 0",
+		},
+		[]string{"sink"},
+	)
+
+	SinkStallRetries = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "cdc",
+			Name:      "sink_stall_retries_total",
+			Help:      "Deliveries retried while waiting for an unavailable sink",
+		},
+		[]string{"sink"},
+	)
+
 	WALLagBytes = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: "cdc",
