@@ -35,7 +35,9 @@ func DefaultResilienceConfig() ResilienceConfig {
 // ResilientSink wraps a Sink with retry and circuit-breaker behavior. When
 // the circuit is open, Process fails fast with domain.ErrCircuitOpen instead
 // of hammering an unhealthy sink; the failure still propagates so the WAL
-// position is not confirmed and the event is redelivered later.
+// position is not confirmed and the event is redelivered later. A failure the
+// sink did not classify is checked against the sink's health once retries
+// are spent, so an outage the sink cannot name still reads as one.
 type ResilientSink struct {
 	inner   domain.Sink
 	breaker *gobreaker.CircuitBreaker[any]
@@ -111,8 +113,11 @@ func (s *ResilientSink) processWithRetry(ctx context.Context, events []domain.CD
 
 		// Retrying a permanent failure or after the context is done
 		// cannot succeed; surface it immediately.
-		if domain.IsPermanent(lastErr) || ctx.Err() != nil || i == s.config.MaxRetries {
+		if domain.IsPermanent(lastErr) || ctx.Err() != nil {
 			return lastErr
+		}
+		if i == s.config.MaxRetries {
+			return s.diagnose(ctx, lastErr)
 		}
 
 		metrics.RetryAttempts.WithLabelValues(s.inner.Name()).Inc()
@@ -125,6 +130,34 @@ func (s *ResilientSink) processWithRetry(ctx context.Context, events []domain.CD
 	}
 
 	return lastErr
+}
+
+// healthProbeTimeout bounds the health check that diagnoses an unclassified
+// failure.
+const healthProbeTimeout = 5 * time.Second
+
+// diagnose decides whether a failure that outlived every retry is about the
+// sink or about the batch, for errors the sink did not classify itself: when
+// the sink's own health check fails too, the sink is down and the failure is
+// marked Unavailable, so the pipeline stalls on it instead of counting it
+// against the batch's first event.
+func (s *ResilientSink) diagnose(ctx context.Context, err error) error {
+	if domain.IsUnavailable(err) {
+		return err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, min(healthProbeTimeout, s.probeTimeout()))
+	defer cancel()
+	if herr := s.inner.HealthCheck(probeCtx); herr != nil {
+		return domain.Unavailable(fmt.Errorf("%w (health check failed: %v)", err, herr))
+	}
+	return err
+}
+
+func (s *ResilientSink) probeTimeout() time.Duration {
+	if s.config.AttemptTimeout > 0 {
+		return s.config.AttemptTimeout
+	}
+	return healthProbeTimeout
 }
 
 func (s *ResilientSink) attempt(ctx context.Context, events []domain.CDCEvent) error {

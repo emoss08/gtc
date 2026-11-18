@@ -58,6 +58,8 @@ type DLQConfig struct {
 	Enabled bool
 	// Threshold is how many full failure cycles (resilience retries plus
 	// stream replay) the same event must go through before it is parked.
+	// Only failures from a sink that is up count; an unavailable sink
+	// never brings an event closer to the queue.
 	Threshold int
 	// MaxEntries caps the queue; when full, parking fails and the
 	// pipeline stalls rather than dropping events.

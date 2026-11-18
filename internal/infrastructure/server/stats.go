@@ -26,6 +26,8 @@ type sinkStats struct {
 	Filtered     float64            `json:"filtered"`
 	Retries      float64            `json:"retries"`
 	ErrorsByType map[string]float64 `json:"errors_by_type"`
+	// Stalled is set while the pipeline holds its position for this sink.
+	Stalled *domain.SinkStall `json:"stalled,omitempty"`
 }
 
 type tableStats struct {
@@ -79,9 +81,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		Backfill:      []domain.BackfillTableStatus{},
 	}
 
-	if s.checker != nil {
-		resp.Ready = s.checker.IsReady()
-	}
+	readiness := s.readiness()
+	resp.Ready = readiness.Status == "ready"
 	if s.wal != nil {
 		resp.Streaming = s.wal.Streaming()
 		resp.CurrentLSN = s.wal.CurrentLSN()
@@ -111,6 +112,10 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		for name, healthy := range s.checker.SinkStatuses() {
 			sink(name).Healthy = healthy
 		}
+	}
+	for i := range readiness.StalledSinks {
+		stall := readiness.StalledSinks[i]
+		sink(stall.Sink).Stalled = &stall
 	}
 
 	tables := make(map[string]*tableStats)

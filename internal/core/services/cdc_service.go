@@ -16,6 +16,10 @@ import (
 type CDCServiceConfig struct {
 	ParallelSinks  bool
 	ExcludedTables map[string]struct{}
+	// StallBackoffInitial and StallBackoffMax pace the retries of a batch
+	// held for an unavailable sink (defaults 1s and 30s).
+	StallBackoffInitial time.Duration
+	StallBackoffMax     time.Duration
 }
 
 type cdcService struct {
@@ -23,6 +27,7 @@ type cdcService struct {
 	walReader ports.WALReader
 	registry  ports.SinkRegistry
 	logger    *slog.Logger
+	stalls    *stalls
 	wg        sync.WaitGroup
 	shutdown  chan struct{}
 	stopOnce  sync.Once
@@ -36,13 +41,32 @@ type CDCServiceParams struct {
 }
 
 func NewCDCService(params CDCServiceParams) ports.CDCService {
+	cfg := params.Config
+	if cfg.StallBackoffInitial <= 0 {
+		cfg.StallBackoffInitial = time.Second
+	}
+	if cfg.StallBackoffMax < cfg.StallBackoffInitial {
+		cfg.StallBackoffMax = max(30*time.Second, cfg.StallBackoffInitial)
+	}
+	logger := params.Logger.With(slog.String("component", "cdc_service"))
 	return &cdcService{
-		config:    params.Config,
+		config:    cfg,
 		walReader: params.WALReader,
 		registry:  params.Registry,
-		logger:    params.Logger.With(slog.String("component", "cdc_service")),
+		logger:    logger,
+		stalls:    newStalls(logger),
 		shutdown:  make(chan struct{}),
 	}
+}
+
+// Stalls lists the sinks the pipeline is waiting for.
+func (s *cdcService) Stalls() []domain.SinkStall {
+	sinks := s.registry.All()
+	order := make([]string, len(sinks))
+	for i, sink := range sinks {
+		order[i] = sink.Name()
+	}
+	return s.stalls.list(order)
 }
 
 func (s *cdcService) Start(ctx context.Context) error {
@@ -227,14 +251,20 @@ func (s *cdcService) ProcessBatch(ctx context.Context, events []domain.CDCEvent)
 // processSink delivers the batch to one sink. Attempts are bounded by the
 // resilience layer's per-attempt timeout; the stream's keepalives continue
 // while sinks work, so a long delivery cannot time the replication
-// connection out.
+// connection out. A sink that is unavailable holds the batch here (see
+// hold) rather than failing it.
 func (s *cdcService) processSink(
 	ctx context.Context,
 	sink domain.Sink,
 	events []domain.CDCEvent,
 ) domain.SinkResult {
 	start := time.Now()
-	err := deliver(ctx, sink, events)
+	done, err := deliver(ctx, sink, events)
+	if domain.IsUnavailable(err) {
+		err = s.hold(ctx, sink, events[done:], err)
+	} else {
+		s.stalls.clear(sink.Name())
+	}
 	duration := time.Since(start)
 
 	metrics.SinkBatchDuration.WithLabelValues(sink.Name()).Observe(duration.Seconds())
@@ -253,19 +283,68 @@ func (s *cdcService) processSink(
 	}
 }
 
+// hold keeps delivering a batch to a sink that is unavailable, with
+// exponential backoff, until it takes the batch, fails it for a reason that
+// is not about its availability, or the service stops. The stream does not
+// advance meanwhile: its position is confirmed only after every sink took the
+// batch, the replication slot keeps the changes, and the reader keeps the
+// connection alive and stops reading ahead once its small queue is full.
+// Nothing is dead-lettered: a sink that is down is not a bad change.
+//
+// Holding the batch here, instead of failing it and replaying the stream,
+// means the sinks that took it are not sent it again on every retry and the
+// replication connection is not torn down once per attempt. A sink with a
+// smaller delivery unit resumes at the piece that failed.
+func (s *cdcService) hold(
+	ctx context.Context,
+	sink domain.Sink,
+	events []domain.CDCEvent,
+	err error,
+) error {
+	name := sink.Name()
+	backoff := s.config.StallBackoffInitial
+	for {
+		s.stalls.record(name, err)
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		case <-s.shutdown:
+			timer.Stop()
+			return err
+		case <-timer.C:
+		}
+		backoff = min(backoff*2, s.config.StallBackoffMax)
+
+		var done int
+		done, err = deliver(ctx, sink, events)
+		if !domain.IsUnavailable(err) {
+			s.stalls.clear(name)
+			return err
+		}
+		events = events[done:]
+	}
+}
+
 // deliver hands the batch over in pieces no larger than the sink's own
-// delivery unit, in order, stopping at the first failure.
-func deliver(ctx context.Context, sink domain.Sink, events []domain.CDCEvent) error {
+// delivery unit, in order, stopping at the first failure. It reports how
+// many events were delivered before the failure.
+func deliver(ctx context.Context, sink domain.Sink, events []domain.CDCEvent) (int, error) {
 	limit := domain.MaxBatchEvents(sink)
 	if limit <= 0 || len(events) <= limit {
-		return sink.Process(ctx, events)
+		if err := sink.Process(ctx, events); err != nil {
+			return 0, err
+		}
+		return len(events), nil
 	}
 	for start := 0; start < len(events); start += limit {
 		if err := sink.Process(ctx, events[start:min(start+limit, len(events))]); err != nil {
-			return err
+			return start, err
 		}
 	}
-	return nil
+	return len(events), nil
 }
 
 func classifyError(err error) string {
@@ -276,6 +355,8 @@ func classifyError(err error) string {
 		return "permanent"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout"
+	case domain.IsUnavailable(err):
+		return "unavailable"
 	case errors.Is(err, context.Canceled):
 		return "canceled"
 	default:

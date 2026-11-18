@@ -184,10 +184,21 @@ func (s *Sink) deliver(ctx context.Context, event domain.CDCEvent) error {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
 		err := fmt.Errorf("webhook returned %s for event %s: %s",
 			resp.Status, event.ID, bytes.TrimSpace(detail))
-		switch resp.StatusCode {
-		case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+		switch code := resp.StatusCode; {
+		case code == http.StatusBadRequest,
+			code == http.StatusRequestEntityTooLarge,
+			code == http.StatusUnprocessableEntity:
 			// The receiver rejected this payload; resending it cannot pass.
 			return domain.Permanent(err)
+		case code >= 500,
+			code == http.StatusRequestTimeout,
+			code == http.StatusTooManyRequests,
+			code == http.StatusUnauthorized,
+			code == http.StatusForbidden,
+			code == http.StatusNotFound:
+			// The receiver is down, overloaded, gone or refusing us: no
+			// payload would pass, so the pipeline waits for it.
+			return domain.Unavailable(err)
 		}
 		return err
 	}

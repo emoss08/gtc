@@ -417,6 +417,7 @@ func newHTTPServer(
 	reader *wal.Reader,
 	health *server.HealthStatus,
 	schemaRecorder *schema.Recorder,
+	svc ports.CDCService,
 	logger *slog.Logger,
 ) *server.Server {
 	var backfillManager ports.BackfillManager
@@ -435,6 +436,7 @@ func newHTTPServer(
 		DLQ:      dlqPort,
 		WAL:      reader,
 		Schema:   schemaRecorder,
+		Stalls:   svc,
 		Info: server.InstanceInfo{
 			Version:     version,
 			SlotName:    cfg.SlotName,

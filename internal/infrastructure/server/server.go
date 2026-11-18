@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,7 @@ type Server struct {
 	sampler    *sampler
 	info       InstanceInfo
 	schema     SchemaHistory
+	stalls     ports.StallReporter
 }
 
 // SchemaHistory exposes recently detected DDL changes to the dashboard.
@@ -65,6 +67,7 @@ type ServerParams struct {
 	WAL      WALInfo               // reader state for /api/stats
 	UI       fs.FS                 // embedded dashboard; nil disables it
 	Schema   SchemaHistory         // detected DDL changes; nil disables /api/schema
+	Stalls   ports.StallReporter   // sinks the pipeline is waiting for
 	Info     InstanceInfo
 	Logger   *slog.Logger
 }
@@ -89,6 +92,7 @@ func New(p ServerParams) *Server {
 		sampler:   newSampler(),
 		info:      p.Info,
 		schema:    p.Schema,
+		stalls:    p.Stalls,
 		pprof:     p.Config.Pprof,
 		httpServer: &http.Server{
 			Addr:         fmt.Sprintf(":%d", p.Config.Port),
@@ -306,17 +310,45 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"healthy"}`))
 }
 
+type readinessResponse struct {
+	Status         string             `json:"status"`
+	StalledSinks   []domain.SinkStall `json:"stalled_sinks,omitempty"`
+	UnhealthySinks []string           `json:"unhealthy_sinks,omitempty"`
+}
+
+// readiness reports whether GTC is ready: the stream is live, every sink's
+// last health check passed, and no sink is holding the stream. It names the
+// sinks that are not.
+func (s *Server) readiness() readinessResponse {
+	resp := readinessResponse{Status: "ready"}
+	if s.stalls != nil {
+		resp.StalledSinks = s.stalls.Stalls()
+	}
+	ready := s.checker != nil && s.checker.IsReady()
+	if s.checker != nil {
+		for name, healthy := range s.checker.SinkStatuses() {
+			if !healthy {
+				resp.UnhealthySinks = append(resp.UnhealthySinks, name)
+			}
+		}
+		slices.Sort(resp.UnhealthySinks)
+	}
+	if !ready || len(resp.StalledSinks) > 0 {
+		resp.Status = "not_ready"
+	}
+	return resp
+}
+
 func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	if s.checker == nil || !s.checker.IsReady() {
+	resp := s.readiness()
+	if resp.Status != "ready" {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"status":"not_ready"}`))
-		return
+	} else {
+		w.WriteHeader(http.StatusOK)
 	}
-
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ready"}`))
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) Start() error {

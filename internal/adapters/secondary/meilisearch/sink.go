@@ -344,12 +344,13 @@ func (s *Sink) awaitTasks(ctx context.Context, tasks []enqueuedTask) error {
 			Limit: int64(len(uids)),
 		})
 		if err != nil {
-			return fmt.Errorf("poll meilisearch tasks: %w", err)
+			return fmt.Errorf("poll meilisearch tasks: %w", classifyAPIError(err))
 		}
 
 		if len(result.Results) < len(uids) {
-			return fmt.Errorf("%w: %d of %d tasks not found", errTasksLost,
-				len(uids)-len(result.Results), len(uids))
+			// Never about the documents: the next attempt enqueues them again.
+			return domain.Unavailable(fmt.Errorf("%w: %d of %d tasks not found", errTasksLost,
+				len(uids)-len(result.Results), len(uids)))
 		}
 
 		finished := 0
@@ -384,8 +385,13 @@ func (s *Sink) awaitTasks(ctx context.Context, tasks []enqueuedTask) error {
 				failed.Status, failed.Error.Message, failed.Error.Code)
 			// invalid_request failures are about the documents (bad id,
 			// bad field shape): retrying the same payload cannot pass.
-			if failed.Error.Type == "invalid_request" {
+			// system (disk full, too many open files) and auth failures
+			// are about the server, whatever the documents.
+			switch failed.Error.Type {
+			case "invalid_request":
 				return domain.Permanent(err)
+			case "system", "auth":
+				return domain.Unavailable(err)
 			}
 			return err
 		}
@@ -398,16 +404,35 @@ func (s *Sink) awaitTasks(ctx context.Context, tasks []enqueuedTask) error {
 	}
 }
 
-// classifyAPIError marks request rejections caused by the payload as
-// permanent; transport failures, throttling and server errors stay
-// retryable.
+// classifyAPIError tells a Meilisearch that cannot take writes from one that
+// rejected the payload. No response at all (connection refused or dropped,
+// the client's own timeout or retries spent), a 5xx, throttling, a request
+// timeout and refused credentials are about the server: Unavailable, so the
+// pipeline stalls until it is back. Any other 4xx, and a payload that cannot
+// be encoded, is about the documents: Permanent, so the dead-letter queue
+// parks them. The client's error does not unwrap to the transport error, so
+// it is classified here rather than by domain.IsUnavailable.
 func classifyAPIError(err error) error {
 	var apiErr *meilisearch.Error
-	if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 &&
-		apiErr.StatusCode != http.StatusRequestTimeout &&
-		apiErr.StatusCode != http.StatusTooManyRequests &&
-		apiErr.StatusCode != http.StatusUnauthorized &&
-		apiErr.StatusCode != http.StatusForbidden {
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	switch apiErr.ErrCode {
+	case meilisearch.MeilisearchCommunicationError,
+		meilisearch.MeilisearchTimeoutError,
+		meilisearch.MeilisearchMaxRetriesExceeded:
+		return domain.Unavailable(err)
+	case meilisearch.ErrCodeMarshalRequest:
+		return domain.Permanent(err)
+	}
+	switch code := apiErr.StatusCode; {
+	case code >= 500,
+		code == http.StatusRequestTimeout,
+		code == http.StatusTooManyRequests,
+		code == http.StatusUnauthorized,
+		code == http.StatusForbidden:
+		return domain.Unavailable(err)
+	case code >= 400:
 		return domain.Permanent(err)
 	}
 	return err

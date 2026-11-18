@@ -59,18 +59,35 @@ trip the circuit breaker.
 
 Consequences to keep in mind:
 
-- A sink that is down does not lose events; it stalls the pipeline (replication
-  slot WAL retention grows) until the sink recovers. A *poison event* is
-  parked in the Redis dead-letter queue instead, and triaged via GET /dlq,
-  POST /dlq/retry, POST /dlq/discard. The DLQ layer isolates it by bisecting
-  the failing batch (halves in order; succeeding halves are delivered): at
-  once for a permanent error, after CDC_DLQ_THRESHOLD failure cycles of the
-  batch (counted against its first event, stable across replays) for a
-  transient one. Circuit-open failures and timeouts never park (a down or
-  slow sink is not a poison event), and a full/unreachable DLQ stalls rather
-  than drops. Sink layering is transform(dlq(resilience(sink))): parked
-  entries hold the already-transformed event, and retries bypass transforms
-  so masking is never re-applied.
+- One rule for every sink: a sink that is down stalls the pipeline and loses
+  nothing; only a change the sink rejects is parked. Sink errors are of three
+  kinds (`internal/core/domain/errors.go`): `domain.Permanent` (the data;
+  parked at once), `domain.Unavailable` (the sink; never counted, split or
+  parked) and the rest (transient while the sink is up; parked after
+  CDC_DLQ_THRESHOLD cycles). `domain.IsUnavailable` also recognizes an open
+  circuit, a timeout and transport errors; each sink marks its own
+  sink-wide failures (5xx, auth, throttling, Redis LOADING/OOM/READONLY,
+  NATS disconnected), and the resilience layer marks an unclassified failure
+  Unavailable when the sink's health check fails too. Sinks must classify
+  new failure modes the same way.
+- An unavailable sink holds the batch inside the CDC service
+  (`cdcService.hold`): retried with backoff (1s to 30s) until the sink takes
+  it, without tearing the stream down, so the sinks that took the batch are
+  not sent it again. The position is shared, so the other sinks wait too.
+  The stall shows in `/readiness` (`stalled_sinks`), `/api/stats`,
+  `cdc_sink_stalled{sink}` and a warning at the start and once a minute.
+- A *poison event* is parked in the Redis dead-letter queue, and triaged via
+  GET /dlq, POST /dlq/retry, POST /dlq/discard. The DLQ layer isolates it by
+  bisecting the failing batch (halves in order; succeeding halves are
+  delivered), counted against its first event (stable across replays), and
+  stops isolating as soon as the sink turns out to be unavailable. A
+  full/unreachable DLQ stalls rather than drops. Nothing retries dead
+  letters automatically: replaying a parked event can write an older version
+  of a row over a newer one, so retries stay a manual, informed choice. Sink
+  layering is
+  transform(dlq(resilience(sink))): parked entries hold the
+  already-transformed event, and retries bypass transforms so masking is
+  never re-applied.
 - `CDC_PROCESS_TIMEOUT` (default 30s) bounds one delivery attempt of one batch
   to one sink. The reader keeps sending standby keepalives from a side
   goroutine while sinks work, so it is independent of `wal_sender_timeout`;

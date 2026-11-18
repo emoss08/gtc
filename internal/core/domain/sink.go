@@ -32,6 +32,16 @@ type SinkResult struct {
 	Duration time.Duration
 }
 
+// SinkStall describes a sink the pipeline is waiting for: it was unavailable
+// when a batch reached it, and the stream holds its position until it takes
+// the batch.
+type SinkStall struct {
+	Sink     string    `json:"sink"`
+	Since    time.Time `json:"since"`
+	Attempts int       `json:"attempts"`
+	Error    string    `json:"error"`
+}
+
 // BatchLimiter is implemented by sinks whose unit of delivery is smaller than
 // a batch — a webhook posts one request per event, so its timeout and retry
 // budget belong to one event, not to thousands. The pipeline splits batches
